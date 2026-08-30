@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TheaterCommand — Operationeel Logistiek Simulatiespel</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- ============ HOOFDMENU ============ -->
+  <div id="screen-menu" class="screen active">
+    <div class="menu-box">
+      <h1>THEATER<span class="accent">COMMAND</span></h1>
+      <p class="subtitle">Operationeel Logistiek Simulatiespel — J-4/J-3 Besliscommando</p>
+      <p class="menu-lede">
+        U bent Operationeel Logistiek Commandant voor een theateroffensief over 400&nbsp;km
+        met een gevechtsmacht van ~500.000 personeelsleden. Dit is geen actiespel — het is een
+        besluitvormingssimulator. Er is nooit genoeg. Elke keuze is een afruil.
+      </p>
+
+      <div class="menu-section">
+        <h2>Scenario</h2>
+        <div id="scenario-list" class="option-grid"></div>
+      </div>
+
+      <div class="menu-section">
+        <h2>Moeilijkheidsgraad (Rode tegenstander)</h2>
+        <div id="difficulty-list" class="option-grid"></div>
+      </div>
+
+      <div class="menu-section">
+        <h2>Opgeslagen spel</h2>
+        <div class="option-grid">
+          <button id="btn-load-save" class="opt-btn" disabled>Laad opgeslagen spel</button>
+        </div>
+      </div>
+
+      <button id="btn-start" class="start-btn">START OPERATIE</button>
+      <p class="menu-footnote">Clausewitz — <em>"Amateurs discuss tactics; professionals discuss logistics."</em></p>
+    </div>
+  </div>
+
+  <!-- ============ SPELSCHERM ============ -->
+  <div id="screen-game" class="screen">
+
+    <header id="header">
+      <div class="hdr-block">
+        <span class="hdr-label">DAG</span>
+        <span id="hdr-day">1</span>/<span id="hdr-maxday">90</span>
+      </div>
+      <div class="hdr-block">
+        <span class="hdr-label">FASE</span>
+        <span id="hdr-time">00:00</span>
+      </div>
+      <div class="hdr-block">
+        <span class="hdr-label">WEER</span>
+        <span id="hdr-weather">—</span>
+      </div>
+      <div class="hdr-block grow">
+        <span class="hdr-label">SCENARIO</span>
+        <span id="hdr-scenario">—</span>
+      </div>
+      <div class="hdr-block">
+        <span class="hdr-label">POLITIEK KREDIET</span>
+        <span id="hdr-political">100%</span>
+      </div>
+      <button id="btn-pause" class="hdr-btn" title="Pauze">⏸</button>
+      <button id="btn-save" class="hdr-btn" title="Opslaan">💾</button>
+      <button id="btn-menu" class="hdr-btn" title="Terug naar menu">✕</button>
+    </header>
+
+    <div id="ooda-bar">
+      <div class="ooda-item" id="ooda-observe"><span class="ooda-label">OBSERVE</span><span class="ooda-dot"></span></div>
+      <div class="ooda-item" id="ooda-orient"><span class="ooda-label">ORIENT</span><span class="ooda-dot"></span></div>
+      <div class="ooda-item" id="ooda-decide"><span class="ooda-label">DECIDE</span><span id="ooda-countdown">--:--</span></div>
+      <div class="ooda-item" id="ooda-act"><span class="ooda-label">ACT</span><span class="ooda-dot"></span></div>
+    </div>
+
+    <main id="main-layout">
+
+      <!-- LINKS: Logistiek -->
+      <aside id="panel-left" class="panel">
+        <div class="panel-tabs">
+          <button class="tab-btn active" data-tab="flow">Supply Flow</button>
+          <button class="tab-btn" data-tab="classes">Klassen</button>
+          <button class="tab-btn" data-tab="transport">Transport</button>
+          <button class="tab-btn" data-tab="nodes">Nodes</button>
+        </div>
+        <div class="panel-body">
+          <div id="tab-flow" class="tab-pane active">
+            <h3>Supply Chain Flow</h3>
+            <div id="flow-diagram"></div>
+          </div>
+          <div id="tab-classes" class="tab-pane">
+            <h3>Class I–X Dashboard</h3>
+            <div id="classes-dashboard"></div>
+          </div>
+          <div id="tab-transport" class="tab-pane">
+            <h3>Transportcapaciteit</h3>
+            <div id="transport-list"></div>
+          </div>
+          <div id="tab-nodes" class="tab-pane">
+            <h3>Node Status</h3>
+            <input id="node-filter" type="text" placeholder="Filter op naam/type…">
+            <div id="node-list"></div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- MIDDEN: Kaart -->
+      <section id="map-wrap">
+        <canvas id="map-canvas" width="1000" height="800"></canvas>
+        <div id="map-legend">
+          <span><i class="dot dot-blue"></i>Blauw</span>
+          <span><i class="dot dot-red"></i>Rood</span>
+          <span><i class="dot dot-grey"></i>Onbekend</span>
+          <span><i class="line line-green"></i>Veilig</span>
+          <span><i class="line line-orange"></i>Onder druk</span>
+          <span><i class="line line-red"></i>Onderbroken</span>
+        </div>
+        <div id="map-tooltip" class="hidden"></div>
+        <div id="corridor-collapse-alert" class="hidden">⚠ CORRIDOR COLLAPSE ALERT ⚠</div>
+      </section>
+
+      <!-- RECHTS: OLBM & Alerts -->
+      <aside id="panel-right" class="panel">
+        <div class="panel-tabs">
+          <button class="tab-btn active" data-tab="olbm">OLBM</button>
+          <button class="tab-btn" data-tab="alerts">Alerts</button>
+          <button class="tab-btn" data-tab="eventlog">Log</button>
+          <button class="tab-btn" data-tab="political">Politiek</button>
+        </div>
+        <div class="panel-body">
+          <div id="tab-olbm" class="tab-pane active">
+            <h3>OLBM ADVIES — <span id="olbm-phase-label">Fase 00:00</span></h3>
+            <div id="olbm-advice-list"></div>
+          </div>
+          <div id="tab-alerts" class="tab-pane">
+            <h3>Critical Alerts</h3>
+            <div id="alerts-list"></div>
+          </div>
+          <div id="tab-eventlog" class="tab-pane">
+            <h3>Event Log</h3>
+            <div id="event-log-list"></div>
+          </div>
+          <div id="tab-political" class="tab-pane">
+            <h3>Political Meter</h3>
+            <div id="political-panel"></div>
+          </div>
+        </div>
+      </aside>
+
+    </main>
+
+    <footer id="footer">
+      <div id="message-stream"></div>
+      <div id="speed-control">
+        <span class="hdr-label">SNELHEID</span>
+        <button class="speed-btn" data-speed="0">⏸</button>
+        <button class="speed-btn active" data-speed="1">1×</button>
+        <button class="speed-btn" data-speed="2">2×</button>
+        <button class="speed-btn" data-speed="5">5×</button>
+        <button class="speed-btn" data-speed="10">10×</button>
+      </div>
+    </footer>
+
+  </div>
+
+  <!-- ============ MODAL OVERLAY ============ -->
+  <div id="modal-overlay" class="hidden">
+    <div id="modal-content"></div>
+  </div>
+
+</div>
+<script src="script.js"></script>
+</body>
+</html>
