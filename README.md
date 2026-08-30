@@ -1,7 +1,10 @@
-# Theater Offensive command
-my first repo
+# Theater Offensive logistics command simulator
 
-HI humans,
-
-My name is Menno and i am a newbie programmer. I am learning to program in Python and C++. My goal is to be able to program a webapplication that can pull information in from several sources and transform that to something meaningfull to me and like-minded spirits.
-
+Browser-based operational logistics command simulator (J-4/J-3 role):
+400km theater offensive, ~500k personnel, full Class I-X supply
+system, 150km support-range rule, OODA/OLBM AI decision advisor with
+accept/adjust/ignore + decision debt tracking, adaptive enemy AI
+(delay/corrosion/counterstrike phases), event cards, political
+directive layer, post-operation debriefing with historical
+comparisons, and save/load via localStorage. Vanilla HTML/CSS/JS,
+no external dependencies.
