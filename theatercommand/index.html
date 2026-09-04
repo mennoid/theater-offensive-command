@@ -21,6 +21,14 @@
       </p>
 
       <div class="menu-section">
+        <h2>Voor je begint</h2>
+        <div class="option-grid">
+          <button id="btn-rules" class="opt-btn"><strong>📖 Spelregels</strong>Doel, panelen, tijdsysteem, de zes besluitcategorieën, degradatie en win/verliesvoorwaarden.</button>
+          <button id="btn-demo" class="opt-btn"><strong>▶ Demo &amp; Legenda</strong>Een rondleiding door het scherm met uitleg per beeldelement, daarna vrij verkennen.</button>
+        </div>
+      </div>
+
+      <div class="menu-section">
         <h2>Scenario</h2>
         <div id="scenario-list" class="option-grid"></div>
       </div>
@@ -66,6 +74,8 @@
         <span class="hdr-label">POLITIEK KREDIET</span>
         <span id="hdr-political">100%</span>
       </div>
+      <span id="demo-badge" class="hidden">DEMO</span>
+      <button id="btn-legend" class="hdr-btn" title="Legenda beeldelementen">?</button>
       <button id="btn-pause" class="hdr-btn" title="Pauze">⏸</button>
       <button id="btn-save" class="hdr-btn" title="Opslaan">💾</button>
       <button id="btn-menu" class="hdr-btn" title="Terug naar menu">✕</button>
@@ -103,6 +113,7 @@
           </div>
           <div id="tab-nodes" class="tab-pane">
             <h3>Node Status</h3>
+            <button id="btn-build-node" class="opt-btn" style="width:100%;margin-bottom:8px;">🏗 Nieuwe node bouwen…</button>
             <input id="node-filter" type="text" placeholder="Filter op naam/type…">
             <div id="node-list"></div>
           </div>

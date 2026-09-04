@@ -219,6 +219,35 @@ input { font-family: var(--font-sans); }
 /* node/unit filter input */
 #node-filter { width: 100%; background: var(--bg-2); border: 1px solid var(--border); color: var(--text-0); padding: 6px 8px; border-radius: 4px; margin-bottom: 8px; font-size: 0.76rem; }
 
+/* priority selector (unit modal) */
+.prio-row { display: flex; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
+.prio-btn { flex: 1; min-width: 110px; background: var(--bg-2); border: 1px solid var(--border); color: var(--text-1); border-radius: 4px; padding: 8px 6px; font-size: 0.72rem; }
+.prio-btn.selected { border-color: var(--amber); color: var(--amber); box-shadow: 0 0 0 1px var(--amber) inset; }
+
+/* guided tour spotlight */
+.tour-spot { position: fixed; border: 2px solid var(--amber); border-radius: 6px; box-shadow: 0 0 0 9999px rgba(0,0,0,0.78); pointer-events: none; transition: all .25s ease; z-index: 200; }
+.tour-card {
+  position: fixed; background: var(--bg-1); border: 1px solid var(--olive-light); border-radius: 6px;
+  padding: 16px 20px; max-width: 320px; z-index: 201; box-shadow: 0 0 30px rgba(0,0,0,0.5);
+}
+.tour-card h4 { margin: 0 0 8px 0; color: var(--amber); font-family: var(--font-mono); font-size: 0.85rem; letter-spacing: 1px; }
+.tour-card p { margin: 0 0 12px 0; font-size: 0.82rem; color: var(--text-1); line-height: 1.5; }
+.tour-card .tour-actions { display: flex; justify-content: space-between; gap: 8px; }
+.tour-card .tour-actions button { background: var(--bg-2); border: 1px solid var(--border); color: var(--text-1); border-radius: 4px; padding: 6px 12px; font-size: 0.76rem; }
+.tour-card .tour-actions button.primary { background: var(--olive); color: #fff; border-color: var(--olive-light); }
+.tour-card .tour-step { font-size: 0.68rem; color: var(--text-dim); font-family: var(--font-mono); }
+#demo-badge { background: var(--amber); color: #1a1a1a; font-weight: 700; padding: 2px 8px; border-radius: 3px; font-size: 0.68rem; letter-spacing: 1px; }
+
+/* legend modal */
+.legend-grid { display: grid; grid-template-columns: 1fr; gap: 6px; }
+.legend-row { display: flex; align-items: center; gap: 10px; padding: 4px 0; }
+.legend-swatch { width: 16px; height: 16px; border-radius: 3px; flex: 0 0 auto; }
+.legend-swatch.round { border-radius: 50%; }
+.legend-swatch.line { width: 20px; height: 3px; border-radius: 2px; }
+.legend-text strong { display: block; font-size: 0.8rem; color: var(--text-0); }
+.legend-text span { font-size: 0.72rem; color: var(--text-dim); }
+.legend-section-title { margin: 14px 0 4px 0; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 1px; color: var(--amber); border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+
 /* ---------------- Modal ---------------- */
 #modal-overlay {
   position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 100;
