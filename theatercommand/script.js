@@ -129,7 +129,7 @@ function weightedPick(items) { // items: [{w, ...}]
 /* 3. STATE & GENERATIE                                                    */
 /* ---------------------------------------------------------------------- */
 let GameState = null;
-let UI = { activeLeftTab: 'flow', activeRightTab: 'olbm', selectedNodeId: null, selectedUnitId: null, selectedCorridorId: null, relocatingNodeId: null, buildingNodeType: null, speed: 1, paused: true, lastTick: 0, phaseElapsed: 0 };
+let UI = { activeLeftTab: 'flow', activeRightTab: 'olbm', selectedNodeId: null, selectedUnitId: null, selectedCorridorId: null, relocatingNodeId: null, buildingNodeType: null, placingPlannedType: null, speed: 1, paused: true, lastTick: 0, phaseElapsed: 0 };
 
 function newGameState(scenarioId, difficultyId, sandboxOpts) {
   const scenario = SCENARIOS.find(s => s.id === scenarioId) || SCENARIOS[0];
@@ -144,9 +144,10 @@ function newGameState(scenarioId, difficultyId, sandboxOpts) {
   const s = {
     scenarioId: scenario.id, scenarioName: scenario.name, difficultyId: difficulty.id,
     gridW, gridH, distanceKm,
+    stage: 'planning', // 'planning' (Fase 0, vóór dag 1) -> 'operation'
     day: 1, phase: 0,
     weather: 'droog', season: 'zomer', mudFactor: 0,
-    units: [], nodes: [], corridors: [], enemy: [], convoys: [],
+    units: [], nodes: [], corridors: [], enemy: [], convoys: [], mapMarkers: [],
     ooda: { observe: 1.0, orient: 1.0, decide: 1.0, act: 1.0 },
     politicalCapital: CFG.START_POLITICAL,
     aiAdvice: [], events: [], eventLog: [], messages: [],
@@ -204,39 +205,85 @@ function genTerrain(s, scenario) {
 }
 
 const NODE_CAP_BASE = { hub: 4000, distributie: 1200, farp: 300, microdepot: 120, energy: 200, medical: 150 };
-const NODE_BUILD_COST = { // klassen verbruikt van de betalende node
+const NODE_BUILD_COST = { // klassen verbruikt van de betalende node (improviseren van een NIEUWE, niet vooraf geplande locatie)
   distributie: { VII: 40, IV: 30 }, farp: { VII: 20, IV: 15 },
   microdepot: { VII: 10, IV: 10 }, energy: { VII: 15, IX: 10 }, medical: { VII: 15, VIII: 15 },
 };
 const NODE_BUILD_PHASES = { distributie: 12, farp: 6, microdepot: 3, energy: 8, medical: 6 }; // 4u per fase: 12-48u
 
+// Activatiedrempels voor VOORAF GEPLANDE nodes: pas operationeel zodra genoeg van de eigen
+// (voor dat type relevante) klassen via konvooien is aangevoerd — "planning ≠ bezit".
+const ACTIVATION_REQ = {
+  distributie: [{ classes: ['IV'], amt: 25, label: 'Infrastructuur (Class IV)' }, { classes: ['I', 'III', 'V'], amt: 40, label: 'Kernvoorraad (I+III+V)' }],
+  farp:        [{ classes: ['IX'], amt: 8, label: 'Onderdelen (Class IX)' }, { classes: ['III', 'V'], amt: 25, label: 'Brandstof + munitie (III+V)' }],
+  microdepot:  [{ classes: ['I', 'III', 'V'], amt: 15, label: 'Kernvoorraad (I+III+V)' }],
+  energy:      [{ classes: ['IX'], amt: 8, label: 'Onderdelen (Class IX)' }, { classes: ['X'], amt: 10, label: 'Energie (Class X)' }],
+  medical:     [{ classes: ['VIII'], amt: 20, label: 'Medisch (Class VIII)' }],
+};
+
+function nodeUsable(nd) {
+  return nd && !nd.underConstruction && !nd.destroyed && !(nd.planned && !nd.active);
+}
+
+function tryActivateNode(s, nd) {
+  if (!nd.planned || nd.active) return;
+  const reqs = ACTIVATION_REQ[nd.type];
+  const allMet = !reqs || reqs.every(r => r.classes.reduce((a, c) => a + (nd.delivered[c] || 0), 0) >= r.amt);
+  if (allMet) {
+    nd.active = true; nd.planned = false;
+    s.messages.push(mkMsg(`Node geactiveerd: ${nd.name} is nu operationeel.`, 'good'));
+  }
+}
+
+// Een vooraf verkende, geplande locatie: geen voorraad, geen logistieke waarde totdat
+// een konvooi arriveert en de activatiedrempel (ACTIVATION_REQ) wordt gehaald.
+function mkPlannedNode(s, type, x, y, n) {
+  const t = NODE_TYPES[type];
+  const capBase = NODE_CAP_BASE[type];
+  const node = {
+    id: uid('nd'), type, name: `${t.label} ${n} (gepland)`,
+    x: clamp(x, 0, s.gridW - 1), y: clamp(y, 0, s.gridH - 1),
+    stock: {}, capacity: {}, delivered: {}, vulnerability: rngRange(0.05, 0.2), underAttackUntil: 0,
+    planned: true, active: false,
+  };
+  t.classes.forEach(c => { node.capacity[c] = capBase * (DAY_CLASSES.includes(c) ? 1 : 0.6); node.stock[c] = 0; node.delivered[c] = 0; });
+  s.nodes.push(node);
+  return node;
+}
+
 function genNodes(s) {
   const w = s.gridW, h = s.gridH;
-  const counts = { hub: Math.max(2, Math.round(w / 12)), distributie: Math.max(3, Math.round(w / 3.2)),
-    farp: Math.max(5, Math.round(w / 1.6)), microdepot: Math.max(8, Math.round(w * 1.25)),
-    energy: Math.max(3, Math.round(w / 3.4)), energy2: 0, medical: Math.max(2, Math.round(w / 6.5)) };
+  // Slechts een handvol nodes is dag 1 al ACTIEF (de strategische hubs). Alle overige
+  // types zijn vooraf verkende, GEPLANDE locaties — leeg totdat de speler ze bevoorraadt.
+  // Aantallen zijn bewust beperkt (~20-30 totaal) zodat handmatige activatie speelbaar blijft.
+  const counts = { hub: Math.max(2, Math.round(w / 12)), distributie: Math.max(2, Math.round(w / 8)),
+    farp: Math.max(3, Math.round(w / 5)), microdepot: Math.max(3, Math.round(w / 6)),
+    energy: Math.max(2, Math.round(w / 10)), medical: Math.max(2, Math.round(w / 13)) };
   let n = 0;
-  const mkNode = (type, xFrac, yFrac) => {
-    const t = NODE_TYPES[type];
+  const mkHub = (xFrac, yFrac) => {
+    const t = NODE_TYPES.hub;
     const node = {
-      id: uid('nd'), type, name: `${t.label} ${(++n)}`,
+      id: uid('nd'), type: 'hub', name: `${t.label} ${(++n)}`,
       x: clamp(xFrac * (w - 1), 0, w - 1), y: clamp(yFrac * (h - 1), 0, h - 1),
-      stock: {}, capacity: {}, vulnerability: rngRange(0.05, 0.2), underAttackUntil: 0,
+      stock: {}, capacity: {}, delivered: {}, vulnerability: rngRange(0.05, 0.2), underAttackUntil: 0,
+      planned: false, active: true, // "ijzeren berg": via spoor uit het thuisland al gevuld
     };
-    const capBase = NODE_CAP_BASE[type];
     t.classes.forEach(c => {
-      node.capacity[c] = capBase * (DAY_CLASSES.includes(c) ? 1 : 0.6);
-      node.stock[c] = node.capacity[c] * rngRange(0.55, 0.95);
+      node.capacity[c] = NODE_CAP_BASE.hub * (DAY_CLASSES.includes(c) ? 1 : 0.6);
+      node.stock[c] = node.capacity[c] * rngRange(0.55, 0.85);
+      node.delivered[c] = 0;
     });
     s.nodes.push(node);
     return node;
   };
-  for (let i = 0; i < counts.hub; i++) mkNode('hub', 0.02 + i * 0.02, (i + 0.5) / counts.hub);
-  for (let i = 0; i < counts.distributie; i++) mkNode('distributie', 0.12 + rng() * 0.35, rng());
-  for (let i = 0; i < counts.farp; i++) mkNode('farp', 0.3 + rng() * 0.6, rng());
-  for (let i = 0; i < counts.microdepot; i++) mkNode('microdepot', 0.1 + rng() * 0.85, rng());
-  for (let i = 0; i < counts.energy; i++) mkNode('energy', 0.15 + rng() * 0.7, rng());
-  for (let i = 0; i < counts.medical; i++) mkNode('medical', 0.05 + rng() * 0.3, rng());
+  const mkPlanned = (type, xFrac, yFrac) => mkPlannedNode(s, type, xFrac * (w - 1), yFrac * (h - 1), (++n));
+
+  for (let i = 0; i < counts.hub; i++) mkHub(0.02 + i * 0.02, (i + 0.5) / counts.hub);
+  for (let i = 0; i < counts.distributie; i++) mkPlanned('distributie', 0.12 + rng() * 0.35, rng());
+  for (let i = 0; i < counts.farp; i++) mkPlanned('farp', 0.3 + rng() * 0.6, rng());
+  for (let i = 0; i < counts.microdepot; i++) mkPlanned('microdepot', 0.1 + rng() * 0.85, rng());
+  for (let i = 0; i < counts.energy; i++) mkPlanned('energy', 0.15 + rng() * 0.7, rng());
+  for (let i = 0; i < counts.medical; i++) mkPlanned('medical', 0.05 + rng() * 0.3, rng());
 }
 
 function genCorridors(s) {
@@ -321,7 +368,7 @@ function gameLoop(ts) {
   if (!UI.lastTick) UI.lastTick = ts;
   const dt = ts - UI.lastTick;
   UI.lastTick = ts;
-  if (!UI.paused && GameState && !GameState.gameOver && UI.speed > 0) {
+  if (!UI.paused && GameState && GameState.stage === 'operation' && !GameState.gameOver && UI.speed > 0) {
     UI.phaseElapsed += dt;
     const need = phaseMs();
     if (UI.phaseElapsed >= need) {
@@ -363,6 +410,8 @@ function advancePhase() {
   checkEventCard(s);
   checkPoliticalDirective(s);
   evaluateDecisionDebt(s);
+  checkUnitElimination(s);
+  updateMapMarkers(s);
   regenerateOlbmAdvice(s);
   updateOoda(s);
 
@@ -388,7 +437,7 @@ function updateWeather(s) {
 function nearestNode(s, unit, classesNeeded) {
   let best = null, bestD = Infinity;
   for (const nd of s.nodes) {
-    if (nd.underConstruction) continue;
+    if (!nodeUsable(nd)) continue;
     if (classesNeeded && !classesNeeded.some(c => NODE_TYPES[nd.type].classes.includes(c))) continue;
     const d = dist(unit, nd);
     if (d < bestD) { bestD = d; best = nd; }
@@ -428,6 +477,7 @@ function resupplyCorridorsAndNodes(s) {
     const chain = cor.nodeChain.map(id => s.nodes.find(n => n.id === id)).filter(Boolean);
     for (let i = 0; i < chain.length - 1; i++) {
       const from = chain[i], to = chain[i + 1];
+      if (!nodeUsable(from) || !nodeUsable(to)) continue; // geplande/niet-geactiveerde nodes doen niet mee aan automatische doorvoer
       const modeCap = cor.mode === 'spoor' ? 2400 : 20 * 12; // ton/dag equivalent
       const perPhase = (modeCap / CFG.PHASES_PER_DAY) * (1 - cor.vulnerability);
       NODE_TYPES[to.type].classes.forEach(c => {
@@ -542,7 +592,13 @@ function resolveConvoys(s) {
       }
     } else {
       const nd = s.nodes.find(x => x.id === cv.targetId);
-      if (nd) nd.stock[cv.cls] = Math.min(nd.capacity[cv.cls] || Infinity, (nd.stock[cv.cls] || 0) + delivered);
+      if (nd) {
+        nd.stock[cv.cls] = Math.min(nd.capacity[cv.cls] || Infinity, (nd.stock[cv.cls] || 0) + delivered);
+        if (nd.planned && !nd.active) {
+          nd.delivered[cv.cls] = (nd.delivered[cv.cls] || 0) + delivered;
+          tryActivateNode(s, nd);
+        }
+      }
     }
     if (lostFrac > 0.4) s.messages.push(mkMsg(`Konvooi zwaar getroffen onderweg — ${Math.round(lostFrac * 100)}% verlies van de ${cv.cls}-lading.`, 'warn'));
     else s.messages.push(mkMsg(`Konvooi gearriveerd: ${fmt1(delivered)} ${cv.cls} afgeleverd.`, 'good'));
@@ -677,6 +733,16 @@ function updateFog(s) {
   }
 }
 
+function checkUnitElimination(s) {
+  for (const u of s.units) {
+    if (u.lossesFrac >= 1 && !u.eliminatedMarked) {
+      u.eliminatedMarked = true;
+      pushMarker(s, u.x, u.y, '✕', '#6b6b6b', 1, true);
+      s.messages.push(mkMsg(`${u.name.split('(')[0].trim()} is uitgeschakeld — niet meer strijdvaardig voor de rest van het offensief.`, 'crit'));
+    }
+  }
+}
+
 function pushHistorySnapshot(s) {
   const avgStockV = s.units.reduce((a, u) => a + u.stock.V, 0) / Math.max(1, s.units.length);
   const avgStockIII = s.units.reduce((a, u) => a + u.stock.III, 0) / Math.max(1, s.units.length);
@@ -804,12 +870,29 @@ function regenerateOlbmAdvice(s) {
     advice.push({ id: uid('adv'), kind: 'forecast', severity: 'warn', title: 'FORECAST', body: p.text, action: null, unitId: p.unit.id });
   });
   olbmNodeGapCheck(s).forEach(g => {
-    advice.push({
-      id: uid('adv'), kind: 'newnode', severity: 'warn',
-      title: 'NIEUWE NODE AANBEVOLEN',
-      body: `${g.unit.name.split('(')[0].trim()} opereert ${fmt1(g.km)}km van dichtstbijzijnde node (>150km-drempel). Advies: micro-depot bouwen in de buurt.`,
-      action: (factor = 1) => { buildMicroDepotNear(s, g.unit, factor); }, unitId: g.unit.id,
-    });
+    const plannedNearby = s.nodes.filter(n => n.planned && !n.active)
+      .map(n => ({ n, d: dist(g.unit, n) })).filter(x => x.d <= 200).sort((a, b) => a.d - b.d)[0];
+    if (plannedNearby) {
+      const nd = plannedNearby.n;
+      const reqs = ACTIVATION_REQ[nd.type] || [];
+      const unmet = reqs.find(r => r.classes.reduce((a, c) => a + (nd.delivered[c] || 0), 0) < r.amt);
+      const cls = unmet ? unmet.classes[0] : null;
+      const source = cls ? nearestNode(s, nd, [cls]).node : null;
+      advice.push({
+        id: uid('adv'), kind: 'activate', severity: 'warn',
+        title: 'ACTIVEER GEPLANDE NODE',
+        body: `${nd.name} ligt ${fmt1(plannedNearby.d)}km van ${g.unit.name.split('(')[0].trim()}, maar is nog niet operationeel (>150km-drempel niet gedekt). Advies: stuur ${cls ? CLASS_LABEL[cls] : 'voorraad'} vanaf ${source ? source.name : 'een actieve node'} om te activeren.`,
+        action: (source && cls) ? (factor = 1) => { sendSupply(s, source.id, nd.id, 'node', cls, 25 * factor, 'vrachtwagen'); } : null,
+        unitId: g.unit.id, nodeId: nd.id,
+      });
+    } else {
+      advice.push({
+        id: uid('adv'), kind: 'newnode', severity: 'warn',
+        title: 'NIEUWE NODE AANBEVOLEN',
+        body: `${g.unit.name.split('(')[0].trim()} opereert ${fmt1(g.km)}km van dichtstbijzijnde node (>150km-drempel) en er is geen geplande locatie in de buurt. Advies: improviseer een micro-depot.`,
+        action: (factor = 1) => { buildMicroDepotNear(s, g.unit, factor); }, unitId: g.unit.id,
+      });
+    }
   });
   olbmEnergyPriority(s).forEach(e => {
     advice.push({
@@ -827,7 +910,7 @@ function buildNewNodeAt(s, type, gx, gy) {
   const cost = NODE_BUILD_COST[type];
   if (!cost) return { ok: false, msg: 'Onbekend nodetype.' };
   const target = { x: gx, y: gy };
-  const payers = s.nodes.filter(n => !n.underConstruction && Object.keys(cost).every(c => (n.stock[c] || 0) >= cost[c]))
+  const payers = s.nodes.filter(n => nodeUsable(n) && Object.keys(cost).every(c => (n.stock[c] || 0) >= cost[c]))
     .sort((a, b) => dist(a, target) - dist(b, target));
   const payer = payers[0];
   if (!payer) return { ok: false, msg: 'Geen enkele node heeft genoeg Class VII/IV/IX-voorraad om dit te bekostigen.' };
@@ -894,6 +977,17 @@ function updateOoda(s) {
 /* ---------------------------------------------------------------------- */
 function enemyStrategicPhase(day) { return day <= 20 ? 'vertraging' : (day <= 50 ? 'corrosion' : 'counterstrike'); }
 
+// Markeringen op de kaart: minimaal 1 speldag zichtbaar (permanent=true voor blijvend uitgeschakelde eenheden/nodes).
+function pushMarker(s, x, y, icon, color, days = 1, permanent = false) {
+  s.mapMarkers.push({ id: uid('mk'), x, y, icon, color, expiresAtPhase: permanent ? Infinity : absPhase(s) + days * CFG.PHASES_PER_DAY });
+}
+function updateMapMarkers(s) {
+  const now = absPhase(s);
+  s.mapMarkers = s.mapMarkers.filter(m => m.expiresAtPhase === Infinity || m.expiresAtPhase > now);
+}
+
+const FRAGILE_NODE_TYPES = ['farp', 'microdepot'];
+
 function enemyAiAct(s) {
   const diff = DIFFICULTIES.find(d => d.id === s.difficultyId) || DIFFICULTIES[1];
   const stratPhase = enemyStrategicPhase(s.day);
@@ -905,16 +999,30 @@ function enemyAiAct(s) {
       const impact = rngRange(0.1, 0.35) * activity;
       cor.vulnerability = clamp(cor.vulnerability + impact * 0.3, 0, 0.9);
       cor.recentAttack = (cor.recentAttack || 0) + impact;
+      const chain = cor.nodeChain.map(id => s.nodes.find(n => n.id === id)).filter(Boolean);
+      if (chain.length) { const mid = chain[Math.floor(chain.length / 2)]; pushMarker(s, mid.x, mid.y, '⚡', '#ffbf00'); }
       s.messages.push(mkMsg(`Vijandelijke actie op ${cor.name} (${stratPhase}).`, 'warn'));
     }
   }
   if (stratPhase !== 'vertraging' && rng() < 0.1 * activity) {
-    const targets = diff.deepfake ? s.nodes.filter(n => n.type === 'energy' || n.type === 'hub') : s.nodes;
-    const node = rngPick(targets.length ? targets : s.nodes);
+    const targets = (diff.deepfake ? s.nodes.filter(n => n.type === 'energy' || n.type === 'hub') : s.nodes)
+      .filter(n => nodeUsable(n) && !n.isHQ);
+    const node = rngPick(targets.length ? targets : s.nodes.filter(n => nodeUsable(n) && !n.isHQ));
     if (node) {
+      const avgBefore = Object.keys(node.stock).reduce((a, c) => a + node.stock[c] / Math.max(1, node.capacity[c]), 0) / Object.keys(node.stock).length;
       node.underAttackUntil = s.day + 1;
       Object.keys(node.stock).forEach(c => { node.stock[c] *= (1 - rngRange(0.05, 0.2) * activity * 0.3); });
+      pushMarker(s, node.x, node.y, '💥', '#ff3333');
       s.messages.push(mkMsg(`Node onder aanval: ${node.name}.`, 'crit'));
+
+      // Zwaar getroffen, reeds kritieke (of fragiele) nodes kunnen permanent uitgeschakeld raken.
+      const destroyChance = (avgBefore < 0.15 ? 0.18 : FRAGILE_NODE_TYPES.includes(node.type) ? 0.08 : 0.03) * activity;
+      if (rng() < destroyChance) {
+        node.destroyed = true;
+        Object.keys(node.stock).forEach(c => { node.stock[c] = 0; });
+        pushMarker(s, node.x, node.y, '☠', '#ff3333', 1, true);
+        s.messages.push(mkMsg(`NODE VERWOEST: ${node.name} — permanent uitgeschakeld voor de rest van het offensief.`, 'crit'));
+      }
     }
   }
   if (diff.ew && rng() < 0.08 * activity) {
@@ -943,15 +1051,23 @@ function enemyAiAct(s) {
 /* ---------------------------------------------------------------------- */
 const EVENT_POOL = [
   { id: 'brug', w: 3, title: 'Brug opgeblazen', text: 'Spoorlijn onderbroken. Herstel: 3-5 dagen, of pontonbrug (1 dag, 50% capaciteit).',
-    apply: s => { const cor = rngPick(s.corridors.filter(c => c.mode === 'spoor')) || rngPick(s.corridors); if (cor) { cor.vulnerability = clamp(cor.vulnerability + 0.4, 0, 0.95); cor.bridgeDownUntil = s.day + rngInt(3, 5); } } },
+    apply: s => { const cor = rngPick(s.corridors.filter(c => c.mode === 'spoor')) || rngPick(s.corridors); if (cor) {
+      cor.vulnerability = clamp(cor.vulnerability + 0.4, 0, 0.95); cor.bridgeDownUntil = s.day + rngInt(3, 5);
+      const chain = cor.nodeChain.map(id => s.nodes.find(n => n.id === id)).filter(Boolean);
+      if (chain.length) { const mid = chain[Math.floor(chain.length / 2)]; pushMarker(s, mid.x, mid.y, '🌉', '#ff3333', Math.max(1, cor.bridgeDownUntil - s.day)); }
+    } } },
   { id: 'sabotage', w: 3, title: 'Sabotage in de achterhoede', text: 'Civiele transporteurs weigeren te rijden. Class I-voorraad daalt 30% voor 2 dagen.',
     apply: s => { s.nodes.forEach(n => { if ('I' in n.stock) n.stock.I *= 0.7; }); } },
   { id: 'dronezwerm', w: 3, title: 'Drone-zwerm aanval', text: '20+ FPV-drones richten zich op een corridor. Escortes vereist, of 12u vertraging.',
-    apply: s => { const cor = rngPick(s.corridors); if (cor) { cor.vulnerability = clamp(cor.vulnerability + 0.3, 0, 0.95); } } },
+    apply: s => { const cor = rngPick(s.corridors); if (cor) {
+      cor.vulnerability = clamp(cor.vulnerability + 0.3, 0, 0.95);
+      const chain = cor.nodeChain.map(id => s.nodes.find(n => n.id === id)).filter(Boolean);
+      if (chain.length) { const mid = chain[Math.floor(chain.length / 2)]; pushMarker(s, mid.x, mid.y, '🛸', '#ffbf00'); }
+    } } },
   { id: 'medevac', w: 2, title: 'Medische evacuatie-crisis', text: 'Veldhospitalen overstroomd. Herprioriteer helikopters naar MEDEVAC.',
-    apply: s => { s.nodes.filter(n => n.type === 'medical').forEach(n => { n.stock.VIII *= 0.6; }); } },
+    apply: s => { s.nodes.filter(n => n.type === 'medical').forEach(n => { n.stock.VIII *= 0.6; pushMarker(s, n.x, n.y, '⛑', '#ffbf00'); }); } },
   { id: 'corruptie', w: 2, title: 'Corruptie-onthulling', text: '15% van voorraden in een depot blijkt niet te bestaan. Morale daalt, politieke druk stijgt.',
-    apply: s => { const nd = rngPick(s.nodes); if (nd) Object.keys(nd.stock).forEach(c => nd.stock[c] *= 0.85); s.politicalCapital = clamp(s.politicalCapital - 4, 0, 100); } },
+    apply: s => { const nd = rngPick(s.nodes.filter(nodeUsable)); if (nd) { Object.keys(nd.stock).forEach(c => nd.stock[c] *= 0.85); pushMarker(s, nd.x, nd.y, '📉', '#ffbf00'); } s.politicalCapital = clamp(s.politicalCapital - 4, 0, 100); } },
   { id: 'supplychain', w: 2, title: 'Westerse supply chain verstoord', text: 'Class IX (halfgeleiders) niet beschikbaar voor 5 dagen. Drone-uitval stijgt.',
     apply: s => { s.units.filter(u => u.type === 'drone').forEach(u => { u.stock.IX = clamp(u.stock.IX - 25, 0, 100); }); } },
 ];
@@ -1048,12 +1164,35 @@ function resizeCanvas() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 
+const MAP_PAD = { l: 34, r: 10, t: 18, b: 10 }; // links/boven ruimte voor de km-coördinaatassen
+
 function mapToPx(s, gx, gy) {
   const canvas = document.getElementById('map-canvas');
   const w = canvas.clientWidth, h = canvas.clientHeight;
-  const pad = 16;
-  const cellW = (w - pad * 2) / s.gridW, cellH = (h - pad * 2) / s.gridH;
-  return { px: pad + gx * cellW, py: pad + gy * cellH, cellW, cellH };
+  const cellW = (w - MAP_PAD.l - MAP_PAD.r) / s.gridW, cellH = (h - MAP_PAD.t - MAP_PAD.b) / s.gridH;
+  return { px: MAP_PAD.l + gx * cellW, py: MAP_PAD.t + gy * cellH, cellW, cellH };
+}
+
+function drawAxes(ctx, s, w, h) {
+  ctx.font = '9px monospace';
+  ctx.textBaseline = 'alphabetic';
+  const stepX = s.gridW <= 20 ? 2 : 5;
+  const stepY = s.gridH <= 20 ? 2 : 5;
+  ctx.strokeStyle = '#8a8d80'; ctx.fillStyle = '#8a8d80'; ctx.lineWidth = 1;
+  for (let x = 0; x < s.gridW; x += stepX) {
+    const { px } = mapToPx(s, x, 0);
+    const km = x * CFG.TILE_KM;
+    ctx.beginPath(); ctx.moveTo(px, MAP_PAD.t - 4); ctx.lineTo(px, MAP_PAD.t); ctx.stroke();
+    ctx.fillText(String(km), px - (km >= 100 ? 8 : km >= 10 ? 5 : 2), MAP_PAD.t - 6);
+  }
+  for (let y = 0; y < s.gridH; y += stepY) {
+    const { py } = mapToPx(s, 0, y);
+    const km = y * CFG.TILE_KM;
+    ctx.beginPath(); ctx.moveTo(MAP_PAD.l - 4, py); ctx.lineTo(MAP_PAD.l, py); ctx.stroke();
+    ctx.fillText(String(km), 2, py + 3);
+  }
+  ctx.fillStyle = '#ffbf00';
+  ctx.fillText('km', 2, MAP_PAD.t - 6);
 }
 
 function renderMap() {
@@ -1105,6 +1244,25 @@ function renderMap() {
   for (const nd of s.nodes) {
     const { px, py } = mapToPx(s, nd.x, nd.y);
     const t = NODE_TYPES[nd.type];
+    if (nd.destroyed) {
+      ctx.strokeStyle = '#ff3333'; ctx.lineWidth = 1.6; ctx.globalAlpha = 0.7;
+      ctx.beginPath(); ctx.moveTo(px - 5, py - 5); ctx.lineTo(px + 5, py + 5); ctx.moveTo(px + 5, py - 5); ctx.lineTo(px - 5, py + 5); ctx.stroke();
+      ctx.globalAlpha = 1;
+      continue;
+    }
+    if (nd.planned && !nd.active) {
+      const reqs = ACTIVATION_REQ[nd.type] || [];
+      const frac = reqs.length ? reqs.reduce((a, r) => a + clamp(r.classes.reduce((x, c) => x + (nd.delivered[c] || 0), 0) / r.amt, 0, 1), 0) / reqs.length : 0;
+      ctx.setLineDash([2, 2]); ctx.strokeStyle = t.color; ctx.lineWidth = 1.2; ctx.globalAlpha = 0.6;
+      ctx.beginPath(); ctx.arc(px, py, t.radius, 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]); ctx.globalAlpha = 1;
+      if (frac > 0) {
+        ctx.strokeStyle = '#ffbf00'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(px, py, t.radius + 2, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2); ctx.stroke();
+      }
+      if (nd.id === UI.selectedNodeId) { ctx.strokeStyle = '#87ceeb'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(px, py, t.radius + 6, 0, Math.PI * 2); ctx.stroke(); }
+      continue;
+    }
     const avgStock = Object.keys(nd.stock).reduce((a, c) => a + nd.stock[c] / Math.max(1, nd.capacity[c]), 0) / Object.keys(nd.stock).length;
     let color = avgStock > 0.4 ? '#4caf50' : avgStock > 0.15 ? '#ffbf00' : '#ff3333';
     ctx.beginPath(); ctx.arc(px, py, t.radius, 0, Math.PI * 2);
@@ -1156,6 +1314,19 @@ function renderMap() {
     ctx.fillStyle = cvColor; ctx.fill(); ctx.strokeStyle = '#0c0d0a'; ctx.lineWidth = 0.8; ctx.stroke();
   }
 
+  // event- en aanvalsmarkeringen (>=1 speldag zichtbaar; permanent voor blijvend uitgeschakelde eenheden/nodes)
+  for (const m of s.mapMarkers) {
+    const { px, py } = mapToPx(s, m.x, m.y);
+    const permanent = m.expiresAtPhase === Infinity;
+    ctx.globalAlpha = permanent ? 0.9 : 0.75 + 0.25 * Math.sin(Date.now() / 200);
+    ctx.font = permanent ? 'bold 13px monospace' : '13px monospace';
+    ctx.fillStyle = m.color;
+    ctx.fillText(m.icon, px - 6, py - 10);
+    ctx.globalAlpha = 1;
+  }
+
+  drawAxes(ctx, s, w, h);
+
   if (s.corridorAlertUntil && s.day * CFG.PHASES_PER_DAY + s.phase < s.corridorAlertUntil) {
     document.getElementById('corridor-collapse-alert').classList.remove('hidden');
   } else {
@@ -1173,6 +1344,12 @@ function renderAll() {
 
   const setDot = (id, v) => { const el = document.querySelector(`#${id} .ooda-dot`); if (!el) return; el.className = 'ooda-dot ' + (v >= 1 ? 'g' : v >= 0.5 ? 'o' : 'r'); };
   setDot('ooda-observe', s.ooda.observe); setDot('ooda-orient', s.ooda.orient);
+
+  document.getElementById('planning-banner').classList.toggle('hidden', s.stage !== 'planning');
+  document.getElementById('ooda-bar').classList.toggle('hidden', s.stage === 'planning');
+  if (s.stage === 'planning') {
+    document.getElementById('planning-count').textContent = `${s.nodes.filter(n => n.planned).length} locaties gepland`;
+  }
 
   renderMessages(s);
   renderFlow(s); renderClasses(s); renderTransport(s); renderNodeList(s);
@@ -1236,6 +1413,20 @@ function renderNodeList(s) {
   const filter = (document.getElementById('node-filter').value || '').toLowerCase();
   let html = '';
   s.nodes.filter(n => !filter || n.name.toLowerCase().includes(filter) || n.type.includes(filter)).slice(0, 150).forEach(nd => {
+    if (nd.destroyed) {
+      html += `<div class="card node-row" data-id="${nd.id}" style="cursor:pointer;">
+        <div class="card-title">${nd.name} <span class="tag tag-crit">☠ VERWOEST</span></div>
+        <div class="card-sub">${NODE_TYPES[nd.type].label}</div></div>`;
+      return;
+    }
+    if (nd.planned && !nd.active) {
+      const reqs = ACTIVATION_REQ[nd.type] || [];
+      const frac = reqs.length ? reqs.reduce((a, r) => a + clamp(r.classes.reduce((x, c) => x + (nd.delivered[c] || 0), 0) / r.amt, 0, 1), 0) / reqs.length : 0;
+      html += `<div class="card node-row" data-id="${nd.id}" style="cursor:pointer;">
+        <div class="card-title">${nd.name} <span class="tag tag-warn">${Math.round(frac * 100)}% geactiveerd</span></div>
+        <div class="card-sub">${NODE_TYPES[nd.type].label} · 📋 gepland, nog niet operationeel</div></div>`;
+      return;
+    }
     const avgStock = Object.keys(nd.stock).reduce((a, c) => a + nd.stock[c] / Math.max(1, nd.capacity[c]), 0) / Object.keys(nd.stock).length;
     const tag = avgStock > 0.4 ? 'tag-ok' : avgStock > 0.15 ? 'tag-warn' : 'tag-crit';
     html += `<div class="card node-row" data-id="${nd.id}" style="cursor:pointer;">
@@ -1305,11 +1496,31 @@ function renderPolitical(s) {
     <div class="card-sub">Directives verschijnen elke 10 dagen. Volgende: dag ${s.lastDirectiveDay + 10}.</div>`;
 }
 
+// #map-tooltip is absoluut gepositioneerd t.o.v. #map-wrap (position:relative), dus de
+// offset moet t.o.v. dát paneel berekend worden — niet t.o.v. de viewport — anders schuift
+// de popup mee met de breedte van het linkerpaneel en kan hij buiten beeld vallen.
+// Kiest bovendien de kant die binnen het paneel past, zodat hij altijd dicht bij de cursor
+// én volledig zichtbaar blijft.
+function positionMapTooltip(clientX, clientY) {
+  const tooltip = document.getElementById('map-tooltip');
+  const wrap = document.getElementById('map-wrap');
+  tooltip.classList.remove('hidden'); // moet zichtbaar zijn om offsetWidth/Height te kunnen meten
+  const wrapRect = wrap.getBoundingClientRect();
+  const tw = tooltip.offsetWidth || 200, th = tooltip.offsetHeight || 50;
+  const localX = clientX - wrapRect.left, localY = clientY - wrapRect.top;
+  let x = localX + 16, y = localY + 16;
+  if (x + tw > wrapRect.width - 6) x = localX - tw - 16;
+  if (y + th > wrapRect.height - 6) y = localY - th - 16;
+  x = clamp(x, 6, Math.max(6, wrapRect.width - tw - 6));
+  y = clamp(y, 6, Math.max(6, wrapRect.height - th - 6));
+  tooltip.style.left = x + 'px';
+  tooltip.style.top = y + 'px';
+}
+
 function showQuoteTooltip(ev, key) {
   const el = document.getElementById('map-tooltip');
   el.innerHTML = `<span class="tooltip-cite">${QUOTES[key]}</span>`;
-  el.style.left = (ev.clientX + 12) + 'px'; el.style.top = (ev.clientY + 12) + 'px';
-  el.classList.remove('hidden');
+  positionMapTooltip(ev.clientX, ev.clientY);
   setTimeout(() => el.classList.add('hidden'), 4500);
 }
 
@@ -1318,6 +1529,15 @@ function showQuoteTooltip(ev, key) {
 /* ---------------------------------------------------------------------- */
 function openNodeModal(nodeId) {
   const s = GameState; const nd = s.nodes.find(n => n.id === nodeId); if (!nd) return;
+  if (nd.destroyed) {
+    setModal(`
+      <h2>${nd.name}</h2>
+      <p>☠ Permanent uitgeschakeld — deze node is verwoest en blijft de rest van het offensief onbruikbaar.</p>
+      <div class="modal-actions"><button id="modal-close" class="primary">Sluiten</button></div>
+    `);
+    document.getElementById('modal-close').onclick = closeModal;
+    return;
+  }
   if (nd.underConstruction) {
     setModal(`
       <h2>${nd.name}</h2>
@@ -1327,10 +1547,27 @@ function openNodeModal(nodeId) {
     document.getElementById('modal-close').onclick = closeModal;
     return;
   }
+  if (nd.planned && !nd.active) {
+    const reqs = ACTIVATION_REQ[nd.type] || [];
+    const progressRows = reqs.map(r => {
+      const have = r.classes.reduce((a, c) => a + (nd.delivered[c] || 0), 0);
+      const pct = clamp(have / r.amt * 100, 0, 100);
+      return `<div class="bar-row"><span class="bar-label" style="width:170px;">${r.label}</span><div class="bar-track"><div class="bar-fill ${pct >= 100 ? '' : 'warn'}" style="width:${pct}%"></div></div><span class="bar-val">${fmt1(have)}/${r.amt}</span></div>`;
+    }).join('');
+    setModal(`
+      <h2>${nd.name}</h2>
+      <p>📋 <strong>Gepland</strong> — nog niet operationeel. Planning ≠ bezit: pas wanneer een konvooi hier voldoende voorraad aflevert, wordt deze locatie actief. Stuur voorraad vanaf een actieve node via diens "Stuur voorraad"-formulier.</p>
+      <h3>Activatievoortgang</h3>
+      ${progressRows || '<p class="card-sub">Geen drempel gedefinieerd.</p>'}
+      <div class="modal-actions"><button id="modal-close" class="primary">Sluiten</button></div>
+    `);
+    document.getElementById('modal-close').onclick = closeModal;
+    return;
+  }
   const rows = Object.keys(nd.stock).map(c => `<tr><td>${CLASS_LABEL[c]}</td><td>${Math.round(nd.stock[c])} / ${Math.round(nd.capacity[c])}</td></tr>`).join('');
 
   const unitOptions = s.units.filter(u => u.lossesFrac < 1).map(u => `<option value="unit:${u.id}">${u.name.split('(')[0].trim()} (${u.priority})</option>`).join('');
-  const nodeOptions = s.nodes.filter(n => n.id !== nd.id && !n.underConstruction).map(n => `<option value="node:${n.id}">${n.name}</option>`).join('');
+  const nodeOptions = s.nodes.filter(n => n.id !== nd.id && !n.underConstruction && !n.destroyed).map(n => `<option value="node:${n.id}">${n.name}${n.planned && !n.active ? ' (gepland)' : ''}</option>`).join('');
   const classOptions = Object.keys(nd.stock).map(c => `<option value="${c}">${CLASS_LABEL[c]}</option>`).join('');
 
   setModal(`
@@ -1472,6 +1709,55 @@ function openBuildNodeChooser() {
   });
 }
 
+function openPlanningNodeChooser() {
+  const options = Object.keys(ACTIVATION_REQ).map(type => {
+    const t = NODE_TYPES[type];
+    const reqs = ACTIVATION_REQ[type].map(r => `${r.amt} ${r.classes.join('/')}`).join(' + ');
+    return `<button class="opt-btn plan-choice" data-type="${type}" style="width:100%;margin-bottom:8px;"><strong>${t.label}</strong>Activatiedrempel later: ${reqs}</button>`;
+  }).join('');
+  setModal(`
+    <h2>Locatie plannen</h2>
+    <p>Kies een type. De locatie wordt gemarkeerd als "gepland" — geen voorraad, geen waarde totdat je tijdens de operatie een konvooi stuurt.</p>
+    ${options}
+    <div class="modal-actions"><button id="modal-close">Annuleren</button></div>
+  `);
+  document.getElementById('modal-close').onclick = closeModal;
+  document.querySelectorAll('.plan-choice').forEach(b => b.onclick = () => {
+    UI.placingPlannedType = b.dataset.type;
+    GameState.messages.push(mkMsg(`Klik op de kaart om de geplande ${NODE_TYPES[b.dataset.type].label} te plaatsen.`));
+    closeModal();
+  });
+}
+
+function openRemovePlannedNodeModal(nodeId) {
+  const s = GameState; const nd = s.nodes.find(n => n.id === nodeId); if (!nd) return;
+  setModal(`
+    <h2>${nd.name}</h2>
+    <p>${NODE_TYPES[nd.type].label} — geplande locatie. Verwijderen tijdens de planningsfase kost niets.</p>
+    <div class="modal-actions">
+      <button id="plan-remove" class="danger">Verwijderen</button>
+      <button id="modal-close">Sluiten</button>
+    </div>
+  `);
+  document.getElementById('modal-close').onclick = closeModal;
+  document.getElementById('plan-remove').onclick = () => {
+    s.nodes = s.nodes.filter(n => n.id !== nodeId);
+    s.messages.push(mkMsg(`Geplande locatie verwijderd: ${nd.name}.`));
+    closeModal(); renderAll();
+  };
+}
+
+function finishPlanning() {
+  const s = GameState; if (!s || s.stage !== 'planning') return;
+  s.corridors = [];
+  genCorridors(s);
+  s.stage = 'operation';
+  s._phaseDecideStart = Date.now();
+  UI.paused = false;
+  s.messages.push(mkMsg('Planningsfase afgerond. Operatie gestart — Dag 1.', 'good'));
+  renderAll();
+}
+
 function openAdjustModal(advice) {
   UI.paused = true;
   setModal(`
@@ -1562,9 +1848,9 @@ function hitTestMap(s, mx, my) {
 
 function pxToGrid(s, mx, my) {
   const canvas = document.getElementById('map-canvas');
-  const w = canvas.clientWidth, h = canvas.clientHeight, pad = 16;
-  const cellW = (w - pad * 2) / s.gridW, cellH = (h - pad * 2) / s.gridH;
-  return { gx: clamp((mx - pad) / cellW, 0, s.gridW - 1), gy: clamp((my - pad) / cellH, 0, s.gridH - 1) };
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const cellW = (w - MAP_PAD.l - MAP_PAD.r) / s.gridW, cellH = (h - MAP_PAD.t - MAP_PAD.b) / s.gridH;
+  return { gx: clamp((mx - MAP_PAD.l) / cellW, 0, s.gridW - 1), gy: clamp((my - MAP_PAD.t) / cellH, 0, s.gridH - 1) };
 }
 
 function wireCanvasInteraction() {
@@ -1575,13 +1861,12 @@ function wireCanvasInteraction() {
     const rect = canvas.getBoundingClientRect();
     const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
     const hit = hitTestMap(s, mx, my);
-    if (UI.relocatingNodeId || UI.buildingNodeType) { canvas.style.cursor = 'crosshair'; tooltip.classList.add('hidden'); return; }
+    if (UI.relocatingNodeId || UI.buildingNodeType || UI.placingPlannedType) { canvas.style.cursor = 'crosshair'; tooltip.classList.add('hidden'); return; }
     if (hit) {
-      tooltip.classList.remove('hidden');
-      tooltip.style.left = (ev.clientX + 14) + 'px'; tooltip.style.top = (ev.clientY + 14) + 'px';
-      if (hit.type === 'node') tooltip.innerHTML = `<strong>${hit.obj.name}</strong><br>${NODE_TYPES[hit.obj.type].label}${hit.obj.underConstruction ? ' · 🚧 in aanbouw' : ''}`;
+      if (hit.type === 'node') tooltip.innerHTML = `<strong>${hit.obj.name}</strong><br>${NODE_TYPES[hit.obj.type].label}${hit.obj.destroyed ? ' · ☠ verwoest' : hit.obj.planned && !hit.obj.active ? ' · 📋 gepland' : hit.obj.underConstruction ? ' · 🚧 in aanbouw' : ''}`;
       else if (hit.type === 'unit') tooltip.innerHTML = `<strong>${hit.obj.name}</strong><br>Status: ${hit.obj.status} · Moraal: ${Math.round(hit.obj.morale)}% · Prio: ${hit.obj.priority}`;
       else tooltip.innerHTML = `<strong>${hit.obj.name}</strong><br>Status: ${hit.obj.status} · Kwetsbaarheid ${Math.round(hit.obj.vulnerability * 100)}%`;
+      positionMapTooltip(ev.clientX, ev.clientY);
       canvas.style.cursor = 'pointer';
     } else { tooltip.classList.add('hidden'); canvas.style.cursor = 'crosshair'; }
   });
@@ -1589,6 +1874,25 @@ function wireCanvasInteraction() {
     const s = GameState; if (!s) return;
     const rect = canvas.getBoundingClientRect();
     const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+
+    if (s.stage === 'planning') {
+      if (UI.placingPlannedType) {
+        const { gx, gy } = pxToGrid(s, mx, my);
+        const nd = mkPlannedNode(s, UI.placingPlannedType, gx, gy, s.nodes.length + 1);
+        s.messages.push(mkMsg(`Locatie gepland: ${nd.name}.`));
+        UI.placingPlannedType = null;
+        renderAll();
+        return;
+      }
+      const hit = hitTestMap(s, mx, my);
+      if (hit && hit.type === 'node') {
+        if (hit.obj.type === 'hub') { openNodeModal(hit.obj.id); return; }
+        openRemovePlannedNodeModal(hit.obj.id);
+      } else {
+        openPlanningNodeChooser();
+      }
+      return;
+    }
 
     if (UI.relocatingNodeId) {
       const { gx, gy } = pxToGrid(s, mx, my);
@@ -1688,17 +1992,19 @@ function showRulesModal() {
   setModal(`
     <h2>Spelregels — TheaterCommand</h2>
     <p>Je bent Operationeel Logistiek Commandant (J-4) van ~500.000 personeelsleden die 400km moeten overbruggen naar Objectief OMEGA binnen 90 dagen. Je wint niet door zelf te schieten — je wint door de logistieke pijplijn overeind te houden terwijl alles erop uit is om die te breken.</p>
+    <h3>Fase 0 — Planning ≠ bezit</h3>
+    <p>Vóór dag 1 zijn alleen de 3-5 strategische hubs gevuld (via spoor uit het thuisland — de "ijzeren berg"). Alle andere nodes zijn slechts <strong>geplande locaties</strong>: gestippeld op de kaart, zonder voorraad, zonder logistieke waarde. In de planningsfase markeer je zelf extra locaties (klik een lege tegel) of verwijder je voorgestelde locaties (klik erop). Klik "START OPERATIE" om te beginnen. Een geplande node wordt pas <strong>actief</strong> wanneer jij tijdens de operatie genoeg van de juiste klassen (per type verschillend, bv. Class IV + I/III/V voor een distributiepunt) per konvooi hebt afgeleverd — planning is geen bezit.</p>
     <h3>Tijd &amp; de OODA-loop</h3>
     <p>1 speldag = 1 minuut reële tijd bij 1× snelheid (instelbaar tot 10×, of pauze). Elke dag heeft 6 fases van 4u. Elke fase doorloopt: <strong>Observe</strong> (sensoren onthullen info) → <strong>Orient</strong> (OLBM genereert advies) → <strong>Decide</strong> (jouw beslistijd — de aftellende klok rechtsboven) → <strong>Act</strong> (het systeem voert alles uit en toont het resultaat).</p>
     <h3>Zes soorten besluiten</h3>
-    <p><strong>A. Voorraden verplaatsen</strong> — klik een node op de kaart, kies bestemming, klasse, hoeveelheid en transportmodus (spoor/vrachtwagen/helikopter/drone). ETA en onderweg-risico worden live getoond voordat je verstuurt.</p>
-    <p><strong>B. Depots bouwen of verplaatsen</strong> — knop "🏗 Nieuwe node bouwen" in de Nodes-tab, klik daarna een locatie op de kaart (kost materiaal van de dichtstbijzijnde node en bouwtijd). Mobiele micro-depots kun je verplaatsen (15% evacuatieverlies).</p>
+    <p><strong>A. Voorraden verplaatsen</strong> — klik een node op de kaart, kies bestemming, klasse, hoeveelheid en transportmodus (spoor/vrachtwagen/helikopter/drone). ETA en onderweg-risico worden live getoond voordat je verstuurt. Dit is ook hoe je een geplande node activeert.</p>
+    <p><strong>B. Depots bouwen of verplaatsen</strong> — knop "🏗 Nieuwe node bouwen" in de Nodes-tab voor een geïmproviseerde, niet vooraf geplande locatie (kost materiaal van de dichtstbijzijnde node én bouwtijd). Mobiele micro-depots kun je verplaatsen (15% evacuatieverlies).</p>
     <p><strong>C. Prioriteiten stellen</strong> — klik een eenheid en zet P1 (kritiek) t/m P4 (laag). Hogere prioriteit krijgt voorrang bij automatische bevoorrading en weegt zwaarder in AI-adviezen.</p>
     <p><strong>D. Corridors beveiligen of herrouteren</strong> — klik een corridorlijn op de kaart: wijs een escorte toe (verlaagt kwetsbaarheid, bindt een pantser/artillerie-eenheid 24u) of herrouteer via een naburige corridor.</p>
     <p><strong>E. AI-advies beoordelen</strong> — het OLBM-paneel rechts geeft elke fase adviezen. Per advies: <strong>Accept</strong> (exact uitvoeren), <strong>Adjust</strong> (percentage aanpassen), of <strong>Ignore</strong>. Genegeerde adviezen tellen mee in je Decision Debt, geëvalueerd in de einddebriefing.</p>
     <p><strong>F. Strategische directives</strong> — elke 10 dagen een keuze van hoger commando. Accepteren geeft politiek krediet maar verhoogt logistiek risico; weigeren is veiliger maar kost krediet. Onder 20% krediet word je vervangen als J-4.</p>
     <h3>Degradatie zonder bevoorrading</h3>
-    <p>&gt;24u zonder Class I (rantsoenen): moraal daalt, desertierisico. &gt;24u zonder Class III (brandstof): voertuigen en drones staan stil. &gt;12u zonder Class V (munitie) in contact: eenheid moet terugvallen. &gt;6u zonder Class VIII (medisch) met gewonden: verliezen lopen op.</p>
+    <p>&gt;24u zonder Class I (rantsoenen): moraal daalt, desertierisico. &gt;24u zonder Class III (brandstof): voertuigen en drones staan stil. &gt;12u zonder Class V (munitie) in contact: eenheid moet terugvallen. &gt;6u zonder Class VIII (medisch) met gewonden: verliezen lopen op. Elke vijandelijke actie (op een corridor, node of eenheid) wordt minstens 1 speldag op de kaart gemarkeerd; een eenheid die volledig is uitgeschakeld of een node die is verwoest, blijft daarna <strong>permanent</strong> gemarkeerd (☠/✕) — dat verlies is definitief voor de rest van het offensief.</p>
     <h3>Win- en verliesvoorwaarden</h3>
     <p><strong>Winnen:</strong> Objectief OMEGA bereikt binnen 90 dagen, mét &lt;30% logistiek transportverlies, &lt;50% personeelsverlies, en politiek krediet &gt;20%.<br>
     <strong>Verliezen:</strong> 90 dagen verstreken zonder OMEGA · &gt;50% personeelsverlies · politiek krediet ≤20% (vervangen als J-4) · kerncommando (HQ) vernietigd · OMEGA bereikt maar met te hoog transportverlies (Pyrrusoverwinning).</p>
@@ -1723,7 +2029,9 @@ function showLegendModal() {
   html += `<div class="legend-section-title">Nodes (logistieke knooppunten)</div><div class="legend-grid">`;
   Object.values(NODE_TYPES).forEach(t => { html += legendRow(`<div class="legend-swatch round" style="background:${t.color};width:${Math.max(10, t.radius * 1.6)}px;height:${Math.max(10, t.radius * 1.6)}px;"></div>`, t.label, `Voert klassen: ${t.classes.join(', ')}.`); });
   html += legendRow(`<div class="legend-swatch round" style="background:#4caf50"></div>`, 'Vulkleur groen / oranje / rood', 'Gemiddelde voorraad t.o.v. capaciteit: &gt;40% groen, 15–40% oranje, &lt;15% rood.');
-  html += legendRow(`<div class="legend-swatch round" style="border:2px dashed #ffbf00;background:transparent"></div>`, '🚧 In aanbouw', 'Node is nog niet operationeel en telt niet mee voor bevoorrading.');
+  html += legendRow(`<div class="legend-swatch round" style="border:2px dashed #6fa8dc;background:transparent"></div>`, '📋 Gepland (gestippeld, leeg)', 'Vooraf gemarkeerde locatie zonder voorraad. Amber boogje = activatievoortgang; volledig gevuld = bijna operationeel. Stuur voorraad vanaf een actieve node om te activeren.');
+  html += legendRow(`<div class="legend-swatch round" style="border:2px dashed #ffbf00;background:transparent"></div>`, '🚧 In aanbouw', 'Speler-geïmproviseerde node, nog niet operationeel (tijdgebonden, kost is al betaald).');
+  html += legendRow(`<div class="legend-swatch" style="position:relative;width:16px;height:16px;">✕</div>`, '☠ Verwoest (rood kruis)', 'Permanent uitgeschakeld — blijft de rest van het offensief onbruikbaar, geen herstel mogelijk.');
   html += legendRow(`<div class="legend-swatch round" style="border:2px solid #ff3333;background:transparent"></div>`, 'Knipperende rode ring', 'Node staat onder vijandelijke aanval.');
   html += legendRow(`<div class="legend-swatch round" style="border:2px solid #ffbf00;background:transparent"></div>`, 'HQ-ring + label', 'Kerncommando — valt dit weg, dan is de operatie direct verloren.');
   html += `</div>`;
@@ -1743,11 +2051,22 @@ function showLegendModal() {
   html += legendRow(`<div class="legend-swatch" style="clip-path:polygon(50% 0,100% 100%,0 100%);background:#ff3333"></div>`, 'Rode driehoek', 'Bekende (gedetecteerde) vijandelijke eenheid — onbekende blijven onzichtbaar in de waas.');
   html += legendRow(`<span style="color:#ff3333;font-weight:bold;font-size:14px;">!</span>`, 'Rood uitroepteken', 'Eenheid is gedegradeerd — geen brandstof of munitie meer.');
   html += legendRow(`<div class="legend-swatch" style="background:#ff3333;width:8px;height:8px;"></div>`, 'Rood hoekje op eenheid', 'Prioriteit P1 (kritiek). Amber = P2, grijs = P4, geen hoekje = P3.');
+  html += legendRow(`<span style="color:#6b6b6b;font-weight:bold;font-size:14px;">✕</span>`, 'Grijs kruis', 'Eenheid volledig uitgeschakeld — permanent, blijft zichtbaar op de plek waar dit gebeurde.');
   html += `</div>`;
 
-  html += `<div class="legend-section-title">Konvooien &amp; overig</div><div class="legend-grid">`;
+  html += `<div class="legend-section-title">Event- &amp; aanvalsmarkeringen</div><div class="legend-grid">`;
+  html += legendRow(`⚡`, 'Bliksem (amber)', 'Vijandelijke actie op een corridor — minimaal 1 speldag zichtbaar.');
+  html += legendRow(`💥`, 'Explosie (rood)', 'Node onder aanval — minimaal 1 speldag zichtbaar.');
+  html += legendRow(`🌉`, 'Brug (rood)', 'Event: brug opgeblazen — zichtbaar tot herstel (3-5 dagen).');
+  html += legendRow(`🛸`, 'Drone (amber)', 'Event: drone-zwermaanval op een corridor.');
+  html += legendRow(`⛑ / 📉`, 'Overig (amber)', 'Medische crisis resp. corruptie-onthulling op een specifieke node.');
+  html += legendRow(`<em style="font-size:0.68rem;">knipperend = tijdelijk</em>`, 'Knipperende vs. vaste marker', 'Tijdelijke markeringen knipperen zachtjes; permanente markeringen (☠, ✕) staan vast en blijven de rest van het offensief.');
+  html += `</div>`;
+
+  html += `<div class="legend-section-title">Konvooien, coördinaten &amp; overig</div><div class="legend-grid">`;
   html += legendRow(`<div class="legend-swatch round" style="background:#ff3333;width:8px;height:8px;"></div>`, 'Kleine bewegende stip', 'Konvooi onderweg tussen bron en bestemming — kleur = vervoerde klasse.');
   html += legendRow(`<div class="legend-swatch" style="border-right:3px dashed #ffbf00;background:transparent;height:16px;"></div>`, 'Stippellijn "OMEGA"', 'Rechterrand van de kaart: het operationele doel.');
+  html += legendRow(`<span style="font-family:monospace;font-size:0.7rem;color:#8a8d80;">0 50 100…</span>`, 'Coördinaatassen (boven/links)', 'Afstand in km vanaf de startlijn — boven horizontaal (opmarsrichting), links verticaal.');
   html += `</div>`;
 
   html += `<div class="legend-section-title">OODA-statusbalk</div><div class="legend-grid">`;
@@ -1763,10 +2082,11 @@ function showLegendModal() {
 
 /* ---- Demo & rondleiding ---- */
 const TOUR_STEPS = [
+  { sel: '#planning-banner', title: 'Fase 0 — Planning', text: 'Vóór dag 1 zijn alleen de strategische hubs gevuld. Alle andere nodes zijn hier al "gepland" (gestippeld op de kaart) maar leeg — die activeer je pas tijdens de operatie door er zelf konvooien heen te sturen.' },
   { sel: '#header', title: 'Header', text: 'Dag, fase, weer, scenario en politiek krediet. Rechts: de "?"-knop (deze legenda), pauze, opslaan en terug naar menu.' },
   { sel: '#ooda-bar', title: 'OODA-statusbalk', text: 'Observe/Orient tonen hoe vers en betrouwbaar je informatiebeeld is. Decide is jouw beslistijd per fase — de aftellende klok. Act toont de uitvoering.' },
   { sel: '#panel-left', title: 'Linkerpaneel — de pijplijn', text: 'Supply Flow, het Class I–X dashboard, transportcapaciteit per corridor, en de nodelijst — hier bouw je ook nieuwe depots.' },
-  { sel: '#map-wrap', title: 'De kaart', text: 'Klik een node om voorraad te sturen, een eenheid om een prioriteit te zetten, of een corridorlijn om escorte/herroutering te regelen. Grijze waas = onverkend gebied.' },
+  { sel: '#map-wrap', title: 'De kaart', text: 'Klik een node om voorraad te sturen, een eenheid om een prioriteit te zetten, of een corridorlijn om escorte/herroutering te regelen. Gestippelde cirkels zijn geplande, nog niet geactiveerde nodes. Boven en links staan coördinaatassen in km vanaf de startlijn. Grijze waas = onverkend gebied.' },
   { sel: '#panel-right', title: 'Rechterpaneel — OLBM', text: 'AI-advies per fase: Accept, Adjust (percentage aanpassen) of Ignore. Genegeerde adviezen tellen mee in je Decision Debt, terug te zien in de eindrapportage.' },
   { sel: '#footer', title: 'Footer', text: 'Berichtenstream met recente gebeurtenissen, en de snelheidsregelaar (pauze t/m 10×).' },
 ];
@@ -1779,6 +2099,7 @@ function removeTourUI() {
 function runTour(i) {
   removeTourUI();
   if (i >= TOUR_STEPS.length) { showLegendModal(); return; }
+  if (i === 1 && GameState && GameState.stage === 'planning') finishPlanning();
   const step = TOUR_STEPS[i];
   const el = document.querySelector(step.sel);
   if (!el) { runTour(i + 1); return; }
@@ -1808,7 +2129,7 @@ function runTour(i) {
 function startDemo() {
   GameState = newGameState('lange_mars', 'cadet', null);
   GameState.demoMode = true;
-  UI = { activeLeftTab: 'flow', activeRightTab: 'olbm', selectedNodeId: null, selectedUnitId: null, selectedCorridorId: null, relocatingNodeId: null, buildingNodeType: null, speed: 0, paused: true, lastTick: 0, phaseElapsed: 0 };
+  UI = { activeLeftTab: 'flow', activeRightTab: 'olbm', selectedNodeId: null, selectedUnitId: null, selectedCorridorId: null, relocatingNodeId: null, buildingNodeType: null, placingPlannedType: null, speed: 0, paused: true, lastTick: 0, phaseElapsed: 0 };
   GameState._phaseDecideStart = Date.now();
   goToGameScreen();
   setTimeout(() => runTour(0), 250);
@@ -1832,7 +2153,7 @@ function buildMenu() {
 
 function startGame(scenarioId, difficultyId, sandboxOpts) {
   GameState = newGameState(scenarioId, difficultyId, sandboxOpts);
-  UI = { activeLeftTab: 'flow', activeRightTab: 'olbm', selectedNodeId: null, selectedUnitId: null, selectedCorridorId: null, relocatingNodeId: null, buildingNodeType: null, speed: 1, paused: false, lastTick: 0, phaseElapsed: 0 };
+  UI = { activeLeftTab: 'flow', activeRightTab: 'olbm', selectedNodeId: null, selectedUnitId: null, selectedCorridorId: null, relocatingNodeId: null, buildingNodeType: null, placingPlannedType: null, speed: 1, paused: false, lastTick: 0, phaseElapsed: 0 };
   GameState._phaseDecideStart = Date.now();
   goToGameScreen();
 }
@@ -1864,6 +2185,7 @@ function wireHeader() {
   document.getElementById('btn-menu').onclick = () => { UI.paused = true; goToMenu(); };
   document.getElementById('node-filter').addEventListener('input', () => renderNodeList(GameState));
   document.getElementById('btn-build-node').addEventListener('click', () => openBuildNodeChooser());
+  document.getElementById('btn-start-operation').addEventListener('click', () => finishPlanning());
 }
 
 window.addEventListener('resize', () => { if (GameState) resizeCanvas(); });

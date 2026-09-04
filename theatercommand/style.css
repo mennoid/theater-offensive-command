@@ -113,6 +113,14 @@ input { font-family: var(--font-sans); }
 }
 .hdr-btn:hover { border-color: var(--olive-light); }
 
+#planning-banner {
+  display: flex; align-items: center; gap: 16px; padding: 10px 16px; flex: 0 0 auto;
+  background: rgba(255,191,0,0.1); border-bottom: 1px solid var(--amber);
+}
+#planning-text { flex: 1; font-size: 0.8rem; color: var(--text-1); line-height: 1.5; }
+#planning-text strong { color: var(--amber); letter-spacing: 1px; margin-right: 6px; }
+#planning-count { display: block; font-family: var(--font-mono); color: var(--amber); font-size: 0.75rem; margin-top: 4px; }
+
 #ooda-bar { display: flex; gap: 0; flex: 0 0 auto; background: var(--bg-2); border-bottom: 1px solid var(--border); }
 .ooda-item { flex: 1; display: flex; align-items: center; justify-content: center; gap: 8px; padding: 5px 0; font-family: var(--font-mono); font-size: 0.75rem; border-right: 1px solid var(--border); }
 .ooda-item:last-child { border-right: none; }
