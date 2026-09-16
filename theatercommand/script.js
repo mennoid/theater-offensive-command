@@ -30,6 +30,8 @@ const TERRAIN = {
   heuvel:    { label: 'Heuvelachtig',color: '#4a4326', speedMod: 0.75 },
 };
 
+const CORRIDOR_MODE_STYLE = { spoor: { width: 2.6, dash: [] }, weg: { width: 1.4, dash: [] }, water: { width: 1.8, dash: [5, 4] } };
+
 const NODE_TYPES = {
   hub:        { label: 'Strategische Hub',    color: '#87ceeb', radius: 9, classes: ['I','III','IV','V','VI','VII','VIII','IX','X'] },
   distributie:{ label: 'Distributiepunt',     color: '#6fa8dc', radius: 7, classes: ['I','III','IV','V','VI','VII','VIII','IX','X'] },
@@ -129,7 +131,7 @@ function weightedPick(items) { // items: [{w, ...}]
 /* 3. STATE & GENERATIE                                                    */
 /* ---------------------------------------------------------------------- */
 let GameState = null;
-let UI = { activeLeftTab: 'flow', activeRightTab: 'olbm', selectedNodeId: null, selectedUnitId: null, selectedCorridorId: null, relocatingNodeId: null, buildingNodeType: null, placingPlannedType: null, hoveredNodeId: null, speed: 1, paused: true, lastTick: 0, phaseElapsed: 0 };
+let UI = { activeLeftTab: 'flow', activeRightTab: 'olbm', selectedNodeId: null, selectedUnitId: null, selectedCorridorId: null, relocatingNodeId: null, buildingNodeType: null, placingPlannedType: null, hoveredNodeId: null, hoveredUnitId: null, corridorLinkFromId: null, pickingSupplyTargetForNodeId: null, highlightedAdviceUnitId: null, highlightedAdviceNodeId: null, speed: 1, paused: true, lastTick: 0, phaseElapsed: 0 };
 
 function newGameState(scenarioId, difficultyId, sandboxOpts) {
   const scenario = SCENARIOS.find(s => s.id === scenarioId) || SCENARIOS[0];
@@ -147,7 +149,7 @@ function newGameState(scenarioId, difficultyId, sandboxOpts) {
     stage: 'planning', // 'planning' (Fase 0, vóór dag 1) -> 'operation'
     day: 1, phase: 0,
     weather: 'droog', season: 'zomer', mudFactor: 0,
-    units: [], nodes: [], corridors: [], enemy: [], convoys: [], mapMarkers: [],
+    units: [], nodes: [], corridors: [], enemy: [], convoys: [], mapMarkers: [], flowPulses: [],
     ooda: { observe: 1.0, orient: 1.0, decide: 1.0, act: 1.0 },
     politicalCapital: CFG.START_POLITICAL,
     aiAdvice: [], events: [], eventLog: [], messages: [],
@@ -155,7 +157,7 @@ function newGameState(scenarioId, difficultyId, sandboxOpts) {
     history: [],
     lastEventDay: 0, lastDirectiveDay: 0,
     fog: null, gameOver: null,
-    corridorAlertUntil: 0, hqNodeId: null,
+    hqNodeId: null,
     stats: { transportLossesTon: 0, transportTotalTon: 0, enemyEliminated: 0, decideDurations: [] },
     transport: { trucks: 0, trucksMax: 0, lastProductionDay: 0 },
   };
@@ -253,12 +255,39 @@ function nodeUsable(nd) {
   return nd && !nd.underConstruction && !nd.destroyed && !(nd.planned && !nd.active);
 }
 
+function nodeInAnyCorridor(s, nodeId) { return s.corridors.some(c => c.nodeChain.includes(nodeId)); }
+
+function lineCrossesRiver(s, a, b) {
+  const steps = 14;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    if (isRiverTile(s, a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)) return true;
+  }
+  return false;
+}
+
+// Nieuw geactiveerde/voltooide nodes mogen nooit wees blijven: gratis, directe basale
+// wegverbinding (of pontonverbinding bij een rivierkruising) naar de dichtstbijzijnde
+// bruikbare node — dit is geen speelbeslissing, gewoon minimale bereikbaarheid.
+function ensureNodeConnected(s, nd) {
+  if (nodeInAnyCorridor(s, nd.id)) return;
+  const nearest = s.nodes.filter(n => n.id !== nd.id && nodeUsable(n)).sort((a, b) => dist(a, nd) - dist(b, nd))[0];
+  if (!nearest) return;
+  const mode = lineCrossesRiver(s, nearest, nd) ? 'water' : 'weg';
+  s.corridors.push({
+    id: uid('cor'), name: `${nearest.name} – ${nd.name}`, nodeChain: [nearest.id, nd.id], mode,
+    vulnerability: rngRange(0.12, 0.28), status: 'veilig', recentLossPct: 0, lossWindow: [],
+  });
+  s.messages.push(mkMsg(`Automatische ${mode === 'water' ? 'pontonverbinding' : 'wegverbinding'} aangelegd: ${nearest.name} – ${nd.name}.`, 'good'));
+}
+
 function tryActivateNode(s, nd) {
   if (!nd.planned || nd.active) return;
   const reqs = ACTIVATION_REQ[nd.type];
   const allMet = !reqs || reqs.every(r => r.classes.reduce((a, c) => a + (nd.delivered[c] || 0), 0) >= r.amt);
   if (allMet) {
     nd.active = true; nd.planned = false;
+    ensureNodeConnected(s, nd);
     s.messages.push(mkMsg(`Node geactiveerd: ${nd.name} is nu operationeel.`, 'good'));
   }
 }
@@ -296,6 +325,16 @@ function activatePlannedNode(s, nodeId) {
   return { ok: true, failures };
 }
 
+// Terreinrealisme bij plaatsing: bos/heuvel bieden dekking (lagere kwetsbaarheid), open
+// terrein is blootgesteld (hoger), rivieren zijn geen geldige bouwlocatie.
+const TERRAIN_VULN_MOD = { open: 1.15, bos: 0.75, heuvel: 0.85, stedelijk: 1.0, rivier: 1.0 };
+function terrainAt(s, gx, gy) {
+  const x = clamp(Math.round(gx), 0, s.gridW - 1), y = clamp(Math.round(gy), 0, s.gridH - 1);
+  return (s.terrainGrid[y] && s.terrainGrid[y][x]) ? s.terrainGrid[y][x].terrain : 'open';
+}
+function isRiverTile(s, gx, gy) { return terrainAt(s, gx, gy) === 'rivier'; }
+function terrainVulnerability(s, gx, gy) { return clamp(rngRange(0.05, 0.2) * (TERRAIN_VULN_MOD[terrainAt(s, gx, gy)] || 1), 0.03, 0.4); }
+
 // Een vooraf verkende, geplande locatie: geen voorraad, geen logistieke waarde totdat
 // een konvooi arriveert en de activatiedrempel (ACTIVATION_REQ) wordt gehaald.
 function mkPlannedNode(s, type, x, y, n) {
@@ -304,7 +343,7 @@ function mkPlannedNode(s, type, x, y, n) {
   const node = {
     id: uid('nd'), type, name: `${t.label} ${n} (gepland)`,
     x: clamp(x, 0, s.gridW - 1), y: clamp(y, 0, s.gridH - 1),
-    stock: {}, capacity: {}, delivered: {}, vulnerability: rngRange(0.05, 0.2), underAttackUntil: 0,
+    stock: {}, capacity: {}, delivered: {}, vulnerability: terrainVulnerability(s, x, y), underAttackUntil: 0,
     planned: true, active: false,
   };
   t.classes.forEach(c => { node.capacity[c] = capBase * (DAY_CLASSES.includes(c) ? 1 : 0.6); node.stock[c] = 0; node.delivered[c] = 0; });
@@ -376,7 +415,12 @@ function genUnits(s, troopMult) {
   let totalPersonnel = 0;
   const targetTotal = 500000 * troopMult;
   const brigades = [];
+  // Elk Leger krijgt een eigen sector (band) over de breedte van de kaart, zodat de
+  // eigen divisies/brigades geografisch bij elkaar blijven i.p.v. willekeurig verspreid.
+  const bandH = (s.gridH - 4) / legerCount;
   for (let L = 1; L <= legerCount; L++) {
+    const bandY0 = 2 + (L - 1) * bandH;
+    const legerY = () => rngRange(bandY0 + bandH * 0.12, bandY0 + bandH * 0.88);
     for (let D = 1; D <= divPerLeger; D++) {
       const brigCount = rngInt(3, 4);
       for (let B = 1; B <= brigCount; B++) {
@@ -387,8 +431,8 @@ function genUnits(s, troopMult) {
         brigades.push({
           id: uid('brig'), name: `${L}e Leger / ${D}e Div / Brig ${B} (${ut.label})`,
           leger: L, divisie: D, type, system: ut.system, personnel,
-          x: rngRange(0, 1.5), y: rngRange(2, s.gridH - 2),
-          destination: { x: s.gridW - 1, y: rngRange(2, s.gridH - 2) },
+          x: rngRange(0, 1.5), y: legerY(),
+          destination: { x: s.gridW - 1, y: legerY() },
           status: 'moving', autoAdvance: true, morale: 100, lossesFrac: 0, priority: 'P3', autoOrders: false,
           stock: { I: rngRange(3, 6), III: rngRange(3, 6), V: rngRange(3, 6), VIII: rngRange(3, 6),
             IV: rngRange(60, 90), VI: rngRange(60, 90), VII: rngRange(70, 95), IX: rngRange(60, 90), X: rngRange(50, 85) },
@@ -468,12 +512,14 @@ function advancePhase() {
   updateCorridorStatus(s);
   updateEscorts(s);
   updateNodeConstruction(s);
+  updateCorridorConstruction(s);
   updateFog(s);
   checkEventCard(s);
   checkPoliticalDirective(s);
   evaluateDecisionDebt(s);
   checkUnitElimination(s);
   updateMapMarkers(s);
+  updateFlowPulses(s);
   regenerateOlbmAdvice(s);
   updateOoda(s);
 
@@ -546,11 +592,12 @@ function moveUnits(s) {
 function resupplyCorridorsAndNodes(s) {
   // Voorraad "stroomt" langs elke corridor-keten van hoog naar laag echelon, beperkt door capaciteit & kwetsbaarheid.
   for (const cor of s.corridors) {
+    if (cor.underConstruction) continue; // corridor in aanleg voert nog niets af
     const chain = cor.nodeChain.map(id => s.nodes.find(n => n.id === id)).filter(Boolean);
     for (let i = 0; i < chain.length - 1; i++) {
       const from = chain[i], to = chain[i + 1];
       if (!nodeUsable(from) || !nodeUsable(to)) continue; // geplande/niet-geactiveerde nodes doen niet mee aan automatische doorvoer
-      const modeCap = cor.mode === 'spoor' ? 2400 : 20 * 12; // ton/dag equivalent
+      const modeCap = cor.mode === 'spoor' ? 2400 : cor.mode === 'water' ? 150 : 20 * 12; // ton/dag equivalent (pontonbrug is traag)
       const perPhase = (modeCap / CFG.PHASES_PER_DAY) * (1 - cor.vulnerability);
       NODE_TYPES[to.type].classes.forEach(c => {
         if (!(c in from.stock)) return;
@@ -564,6 +611,7 @@ function resupplyCorridorsAndNodes(s) {
           s.stats.transportLossesTon += lost;
           from.stock[c] -= sent;
           to.stock[c] += sent - lost;
+          s.flowPulses.push({ id: uid('fp'), fromX: from.x, fromY: from.y, toX: to.x, toY: to.y, cls: c, startPhase: absPhase(s) });
         }
       });
     }
@@ -803,12 +851,15 @@ function updateCorridorStatus(s) {
     );
     cor.recentAttack = 0;
     const windowLoss = cor.lossWindow.reduce((a, w) => a + w.pct, 0);
+    const wasOnderbroken = cor.status === 'onderbroken';
     if (windowLoss > 0.4 || bridgeDown) {
       cor.status = 'onderbroken';
-      s.corridorAlertUntil = now + 2;
-      if (windowLoss > 0.4) s.messages.push(mkMsg(`CORRIDOR COLLAPSE: ${cor.name} >40% uitval in 6u — herroutering vereist.`, 'crit'));
-    } else if (cor.vulnerability > 0.35) cor.status = 'onder_druk';
-    else cor.status = 'veilig';
+      if (!wasOnderbroken) {
+        cor.alertAcknowledged = false; // vers alert: knippert opnieuw tot bevestigd
+        if (windowLoss > 0.4) s.messages.push(mkMsg(`CORRIDOR COLLAPSE: ${cor.name} >40% uitval in 6u — herroutering vereist.`, 'crit'));
+      }
+    } else if (cor.vulnerability > 0.35) { cor.status = 'onder_druk'; cor.alertAcknowledged = false; }
+    else { cor.status = 'veilig'; cor.alertAcknowledged = false; }
   }
 }
 
@@ -830,6 +881,7 @@ function updateNodeConstruction(s) {
     if (nd.underConstruction && nd.constructionCompletePhase <= now) {
       nd.underConstruction = false;
       s.messages.push(mkMsg(`Node voltooid: ${nd.name}.`, 'good'));
+      ensureNodeConnected(s, nd);
     }
   }
 }
@@ -1055,6 +1107,7 @@ function regenerateOlbmAdvice(s) {
 
 /* ---- Handmatige depotbouw (speleractie B: "Depots opbouwen of verplaatsen") ---- */
 function buildNewNodeAt(s, type, gx, gy) {
+  if (isRiverTile(s, gx, gy)) return { ok: false, msg: 'Kan geen node op een rivier plaatsen — kies een oeverpunt.' };
   const cost = NODE_BUILD_COST[type];
   if (!cost) return { ok: false, msg: 'Onbekend nodetype.' };
   const target = { x: gx, y: gy };
@@ -1067,7 +1120,7 @@ function buildNewNodeAt(s, type, gx, gy) {
   const capBase = NODE_CAP_BASE[type];
   const node = {
     id: uid('nd'), type, name: `${t.label} ${s.nodes.length + 1} (nieuw)`,
-    x: gx, y: gy, stock: {}, capacity: {}, vulnerability: 0.15, underAttackUntil: 0,
+    x: gx, y: gy, stock: {}, capacity: {}, vulnerability: terrainVulnerability(s, gx, gy), underAttackUntil: 0,
     underConstruction: true, constructionCompletePhase: absPhase(s) + NODE_BUILD_PHASES[type],
   };
   t.classes.forEach(c => { node.capacity[c] = capBase * (DAY_CLASSES.includes(c) ? 1 : 0.6); node.stock[c] = node.capacity[c] * 0.2; });
@@ -1086,9 +1139,11 @@ function relocateNode(s, nodeId, gx, gy) {
   if (!nd) return { ok: false, msg: 'Node niet gevonden.' };
   if (nd.type === 'hub') return { ok: false, msg: 'Strategische hubs zijn vaste spoorwegterminals en kunnen niet verplaatst worden.' };
   if (!nodeUsable(nd)) return { ok: false, msg: 'Alleen geactiveerde, operationele nodes kunnen verplaatst worden.' };
+  if (isRiverTile(s, gx, gy)) return { ok: false, msg: 'Kan geen node op een rivier plaatsen — kies een oeverpunt.' };
   const lossFrac = NODE_RELOCATE_LOSS[nd.type] || 0.2;
   Object.keys(nd.stock).forEach(c => { nd.stock[c] *= (1 - lossFrac); });
   nd.x = gx; nd.y = gy;
+  nd.vulnerability = terrainVulnerability(s, gx, gy);
   s.messages.push(mkMsg(`${nd.name} verplaatst met resterende voorraad — ${Math.round(lossFrac * 100)}% evacuatieverlies geleden.`, 'warn'));
   return { ok: true };
 }
@@ -1139,6 +1194,11 @@ function pushMarker(s, x, y, icon, color, days = 1, permanent = false) {
 function updateMapMarkers(s) {
   const now = absPhase(s);
   s.mapMarkers = s.mapMarkers.filter(m => m.expiresAtPhase === Infinity || m.expiresAtPhase > now);
+}
+
+function updateFlowPulses(s) {
+  const now = absPhase(s);
+  s.flowPulses = s.flowPulses.filter(fp => now - fp.startPhase < 1).slice(-120);
 }
 
 const FRAGILE_NODE_TYPES = ['farp', 'microdepot'];
@@ -1309,6 +1369,79 @@ function rerouteCorridor(s, corridorId) {
   return { ok: true };
 }
 
+/* ---- Handmatig corridors aanleggen/loskoppelen (rechtsklik op een node) ----
+   De gratis basiskoppeling (ensureNodeConnected) is puur bereikbaarheid; een extra of
+   omgeleide koppeling die de speler zelf aanlegt is een echte keuze en kost tijd + materiaal,
+   net als het bouwen van een nieuwe node. */
+const CORRIDOR_LINK_COST = {
+  weg:   { VII: 15, IV: 10, phases: 6 },
+  spoor: { VII: 30, IV: 20, phases: 16 },
+  water: { VII: 20, IV: 15, phases: 10 },
+};
+
+function nodesShareCorridor(s, aId, bId) {
+  return s.corridors.some(c => c.nodeChain.includes(aId) && c.nodeChain.includes(bId));
+}
+
+function corridorLinkMode(s, a, b) {
+  if (lineCrossesRiver(s, a, b)) return 'water';
+  if ((a.type === 'hub' || a.type === 'distributie') && (b.type === 'hub' || b.type === 'distributie')) return 'spoor';
+  return 'weg';
+}
+
+function completeCorridorLink(s, fromId, toId) {
+  const a = s.nodes.find(n => n.id === fromId), b = s.nodes.find(n => n.id === toId);
+  if (!a || !b) return { ok: false, msg: 'Ongeldige node.' };
+  if (a.id === b.id) return { ok: false, msg: 'Kies een andere node.' };
+  if (!nodeUsable(a) || !nodeUsable(b)) return { ok: false, msg: 'Beide nodes moeten actief en operationeel zijn.' };
+  if (nodesShareCorridor(s, a.id, b.id)) return { ok: false, msg: 'Deze nodes zijn al rechtstreeks verbonden.' };
+  const mode = corridorLinkMode(s, a, b);
+  const cost = CORRIDOR_LINK_COST[mode];
+  const costKeys = Object.keys(cost).filter(k => k !== 'phases');
+  const payer = [a, b, ...s.nodes.filter(nodeUsable)]
+    .find(n => costKeys.every(c => (n.stock[c] || 0) >= cost[c]));
+  if (!payer) return { ok: false, msg: `Onvoldoende voorraad (${costKeys.map(c => `${cost[c]} ${c}`).join(' + ')}) om deze corridor aan te leggen.` };
+  costKeys.forEach(c => { payer.stock[c] -= cost[c]; });
+  s.corridors.push({
+    id: uid('cor'), name: `${a.name} – ${b.name}`, nodeChain: [a.id, b.id], mode,
+    vulnerability: rngRange(0.15, 0.3), status: 'veilig', recentLossPct: 0, lossWindow: [],
+    underConstruction: true, constructionCompletePhase: absPhase(s) + cost.phases,
+  });
+  s.messages.push(mkMsg(`Corridor-aanleg gestart: ${a.name} – ${b.name} (${mode}), gefinancierd vanuit ${payer.name}. Klaar over ${cost.phases * CFG.PHASE_HOURS}u.`, 'good'));
+  return { ok: true };
+}
+
+function removeNodeFromCorridor(s, corridorId, nodeId) {
+  const cor = s.corridors.find(c => c.id === corridorId);
+  if (!cor) return { ok: false, msg: 'Corridor niet gevonden.' };
+  cor.nodeChain = cor.nodeChain.filter(id => id !== nodeId);
+  if (cor.nodeChain.length < 2) {
+    s.corridors = s.corridors.filter(c => c.id !== cor.id);
+    s.messages.push(mkMsg(`Corridor opgeheven: ${cor.name} (te weinig knooppunten over).`, 'warn'));
+  } else {
+    s.messages.push(mkMsg(`Node losgekoppeld van ${cor.name}.`, 'warn'));
+  }
+  return { ok: true };
+}
+
+function deleteCorridor(s, corridorId) {
+  const cor = s.corridors.find(c => c.id === corridorId);
+  if (!cor) return { ok: false, msg: 'Corridor niet gevonden.' };
+  s.corridors = s.corridors.filter(c => c.id !== corridorId);
+  s.messages.push(mkMsg(`Corridor opgeheven: ${cor.name}.`, 'warn'));
+  return { ok: true };
+}
+
+function updateCorridorConstruction(s) {
+  const now = absPhase(s);
+  for (const cor of s.corridors) {
+    if (cor.underConstruction && cor.constructionCompletePhase <= now) {
+      cor.underConstruction = false;
+      s.messages.push(mkMsg(`Corridor voltooid: ${cor.name}.`, 'good'));
+    }
+  }
+}
+
 function checkPoliticalDirective(s) {
   if (s.day - s.lastDirectiveDay >= 10 && s.phase === 0 && s.day > 1) {
     s.lastDirectiveDay = s.day;
@@ -1403,18 +1536,37 @@ function renderMap() {
   for (const cor of s.corridors) {
     const chain = cor.nodeChain.map(id => s.nodes.find(n => n.id === id)).filter(Boolean);
     if (chain.length < 2) continue;
-    ctx.strokeStyle = cor.status === 'onderbroken' ? '#ff3333' : cor.status === 'onder_druk' ? '#ffbf00' : '#4caf50';
-    ctx.lineWidth = (cor.mode === 'spoor' ? 2.4 : 1.4) + (cor.id === UI.selectedCorridorId ? 1.6 : 0);
-    ctx.globalAlpha = 0.8;
+    const modeStyle = CORRIDOR_MODE_STYLE[cor.mode] || CORRIDOR_MODE_STYLE.weg;
+    if (cor.underConstruction) {
+      ctx.strokeStyle = '#ffbf00'; ctx.setLineDash([3, 3]); ctx.lineWidth = modeStyle.width * 0.7; ctx.globalAlpha = 0.55;
+    } else {
+      ctx.strokeStyle = cor.status === 'onderbroken' ? '#ff3333' : cor.status === 'onder_druk' ? '#ffbf00' : '#4caf50';
+      ctx.setLineDash(modeStyle.dash);
+      const blinking = cor.status === 'onderbroken' && !cor.alertAcknowledged;
+      ctx.globalAlpha = blinking ? (0.4 + 0.6 * Math.abs(Math.sin(Date.now() / 180))) : 0.8;
+      ctx.lineWidth = modeStyle.width + (cor.id === UI.selectedCorridorId ? 1.6 : 0);
+    }
     ctx.beginPath();
     chain.forEach((n, i) => { const { px, py } = mapToPx(s, n.x, n.y); if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py); });
     ctx.stroke();
-    ctx.globalAlpha = 1;
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
     if (cor.escortUntil && cor.escortUntil > absPhase(s)) {
       const mid = chain[Math.floor(chain.length / 2)];
       const { px, py } = mapToPx(s, mid.x, mid.y);
       ctx.fillStyle = '#87ceeb'; ctx.font = '10px monospace'; ctx.fillText('🛡', px - 5, py - 8);
     }
+  }
+
+  // achtergrondstroom: subtiele puls langs corridors waar zojuist automatisch voorraad is doorgevoerd
+  // (loopt gelijk met de reële voortgang binnen de huidige fase, ongeacht snelheid)
+  const flowFrac = clamp(UI.phaseElapsed / Math.max(1, phaseMs()), 0, 1);
+  for (const fp of s.flowPulses) {
+    const frac = flowFrac;
+    const gx = fp.fromX + (fp.toX - fp.fromX) * frac, gy = fp.fromY + (fp.toY - fp.fromY) * frac;
+    const { px, py } = mapToPx(s, gx, gy);
+    const cvColor = { I: '#4caf50', III: '#cccccc', IV: '#b5a642', V: '#ff3333', VI: '#87ceeb', VII: '#6f8a3f', VIII: '#e0e0e0', IX: '#ffbf00', X: '#7ec8e3' }[fp.cls] || '#87ceeb';
+    ctx.beginPath(); ctx.arc(px, py, 1.8, 0, Math.PI * 2);
+    ctx.fillStyle = cvColor; ctx.globalAlpha = 0.5; ctx.fill(); ctx.globalAlpha = 1;
   }
 
   // nodes
@@ -1499,6 +1651,55 @@ function renderMap() {
     }
   }
 
+  // hover: objectief van een eenheid
+  if (UI.hoveredUnitId) {
+    const hu = s.units.find(u => u.id === UI.hoveredUnitId);
+    if (hu && hu.lossesFrac < 1) {
+      const { px: upx, py: upy } = mapToPx(s, hu.x, hu.y);
+      const { px: dpx, py: dpy } = mapToPx(s, hu.destination.x, hu.destination.y);
+      ctx.strokeStyle = '#87ceeb'; ctx.lineWidth = 1.2; ctx.globalAlpha = 0.7; ctx.setLineDash([2, 4]);
+      ctx.beginPath(); ctx.moveTo(upx, upy); ctx.lineTo(dpx, dpy); ctx.stroke();
+      ctx.setLineDash([]); ctx.globalAlpha = 1;
+      ctx.fillStyle = '#87ceeb'; ctx.beginPath(); ctx.arc(dpx, dpy, 3, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  // OLBM-advies gehoverd: betrokken eenheid/node laten oplichten op de kaart
+  if (UI.highlightedAdviceUnitId || UI.highlightedAdviceNodeId) {
+    const pulse = 0.5 + 0.4 * Math.abs(Math.sin(Date.now() / 220));
+    ctx.strokeStyle = '#87ceeb'; ctx.lineWidth = 2.4; ctx.globalAlpha = pulse;
+    if (UI.highlightedAdviceUnitId) {
+      const hu = s.units.find(u => u.id === UI.highlightedAdviceUnitId);
+      if (hu && hu.lossesFrac < 1) { const { px, py } = mapToPx(s, hu.x, hu.y); ctx.strokeRect(px - 8, py - 8, 16, 16); }
+    }
+    if (UI.highlightedAdviceNodeId) {
+      const hn = s.nodes.find(n => n.id === UI.highlightedAdviceNodeId);
+      if (hn) { const t = NODE_TYPES[hn.type]; const { px, py } = mapToPx(s, hn.x, hn.y); ctx.beginPath(); ctx.arc(px, py, t.radius + 6, 0, Math.PI * 2); ctx.stroke(); }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // kies-modus: geldige doelen laten subtiel pulseren zodat direct duidelijk is wat aanklikbaar is
+  if (UI.pickingSupplyTargetForNodeId || UI.corridorLinkFromId) {
+    const pulse = 0.35 + 0.35 * Math.abs(Math.sin(Date.now() / 300));
+    ctx.strokeStyle = '#ffbf00'; ctx.lineWidth = 1.6; ctx.globalAlpha = pulse;
+    if (UI.pickingSupplyTargetForNodeId) {
+      const sourceId = UI.pickingSupplyTargetForNodeId;
+      s.units.filter(u => u.lossesFrac < 1).forEach(u => { const { px, py } = mapToPx(s, u.x, u.y); ctx.strokeRect(px - 7, py - 7, 14, 14); });
+      s.nodes.filter(n => n.id !== sourceId && !n.underConstruction && !n.destroyed).forEach(n => {
+        const t = NODE_TYPES[n.type]; const { px, py } = mapToPx(s, n.x, n.y);
+        ctx.beginPath(); ctx.arc(px, py, t.radius + 4, 0, Math.PI * 2); ctx.stroke();
+      });
+    } else if (UI.corridorLinkFromId) {
+      const sourceId = UI.corridorLinkFromId;
+      s.nodes.filter(n => n.id !== sourceId && nodeUsable(n) && !nodesShareCorridor(s, sourceId, n.id)).forEach(n => {
+        const t = NODE_TYPES[n.type]; const { px, py } = mapToPx(s, n.x, n.y);
+        ctx.beginPath(); ctx.arc(px, py, t.radius + 4, 0, Math.PI * 2); ctx.stroke();
+      });
+    }
+    ctx.globalAlpha = 1;
+  }
+
   // konvooien onderweg
   for (const cv of s.convoys) {
     const frac = clamp((absPhase(s) - cv.startPhase) / Math.max(0.01, cv.etaPhases), 0, 1);
@@ -1521,12 +1722,6 @@ function renderMap() {
   }
 
   drawAxes(ctx, s, w, h);
-
-  if (s.corridorAlertUntil && s.day * CFG.PHASES_PER_DAY + s.phase < s.corridorAlertUntil) {
-    document.getElementById('corridor-collapse-alert').classList.remove('hidden');
-  } else {
-    document.getElementById('corridor-collapse-alert').classList.add('hidden');
-  }
 }
 
 function renderAll() {
@@ -1607,36 +1802,53 @@ function renderTransport(s) {
   el.innerHTML = html || '<div class="card-sub">Geen corridors.</div>';
 }
 
+// Klik op een lijstitem selecteert/highlight de node op de kaart (de kaart is de primaire
+// werkplek); een expliciete "Details"-knop opent het venster met acties.
+const DETAILS_BTN = (id) => `<button class="node-details-btn" data-id="${id}" style="width:100%;margin-top:6px;padding:4px 0;font-size:0.68rem;background:var(--bg-3);border:1px solid var(--border);color:var(--text-1);border-radius:4px;">🔍 Details</button>`;
+
 function renderNodeList(s) {
   const el = document.getElementById('node-list');
   const filter = (document.getElementById('node-filter').value || '').toLowerCase();
   let html = '';
   s.nodes.filter(n => !filter || n.name.toLowerCase().includes(filter) || n.type.includes(filter)).slice(0, 150).forEach(nd => {
     if (nd.destroyed) {
-      html += `<div class="card node-row" data-id="${nd.id}" style="cursor:pointer;">
+      html += `<div class="card node-row" data-id="${nd.id}">
         <div class="card-title">${nd.name} <span class="tag tag-crit">☠ VERWOEST</span></div>
-        <div class="card-sub">${NODE_TYPES[nd.type].label}</div></div>`;
+        <div class="card-sub">${NODE_TYPES[nd.type].label}</div>
+        ${DETAILS_BTN(nd.id)}</div>`;
       return;
     }
     if (nd.planned && !nd.active) {
       const reqs = ACTIVATION_REQ[nd.type] || [];
       const frac = reqs.length ? reqs.reduce((a, r) => a + clamp(r.classes.reduce((x, c) => x + (nd.delivered[c] || 0), 0) / r.amt, 0, 1), 0) / reqs.length : 0;
       html += `<div class="card node-row" data-id="${nd.id}">
-        <div class="card-title" style="cursor:pointer;">${nd.name} <span class="tag tag-warn">${Math.round(frac * 100)}% geactiveerd</span></div>
-        <div class="card-sub" style="cursor:pointer;">${NODE_TYPES[nd.type].label} · 📋 gepland, nog niet operationeel</div>
+        <div class="card-title">${nd.name} <span class="tag tag-warn">${Math.round(frac * 100)}% geactiveerd</span></div>
+        <div class="card-sub">${NODE_TYPES[nd.type].label} · 📋 gepland, nog niet operationeel</div>
         <button class="activate-node-btn" data-id="${nd.id}" style="width:100%;margin-top:6px;background:var(--olive);color:#fff;border:1px solid var(--olive-light);border-radius:4px;padding:5px 0;font-size:0.7rem;">⚡ Activeer vanaf dichtstbijzijnde hub</button>
+        ${DETAILS_BTN(nd.id)}
       </div>`;
       return;
     }
     const avgStock = Object.keys(nd.stock).reduce((a, c) => a + nd.stock[c] / Math.max(1, nd.capacity[c]), 0) / Object.keys(nd.stock).length;
     const tag = avgStock > 0.4 ? 'tag-ok' : avgStock > 0.15 ? 'tag-warn' : 'tag-crit';
-    html += `<div class="card node-row" data-id="${nd.id}" style="cursor:pointer;">
+    html += `<div class="card node-row" data-id="${nd.id}">
       <div class="card-title">${nd.name} <span class="tag ${tag}">${Math.round(avgStock * 100)}%</span></div>
       <div class="card-sub">${NODE_TYPES[nd.type].label}${nd.underAttackUntil > s.day ? ' · ⚠ ONDER AANVAL' : ''}</div>
+      ${DETAILS_BTN(nd.id)}
     </div>`;
   });
   el.innerHTML = html;
-  el.querySelectorAll('.node-row').forEach(r => r.onclick = () => { UI.selectedNodeId = r.dataset.id; openNodeModal(r.dataset.id); });
+  if (UI.selectedNodeId) { const sel = el.querySelector(`.node-row[data-id="${UI.selectedNodeId}"]`); if (sel) sel.classList.add('selected'); }
+  el.querySelectorAll('.node-row').forEach(r => r.addEventListener('click', (ev) => {
+    if (ev.target.closest('button')) return; // knoppen regelen hun eigen actie
+    UI.selectedNodeId = r.dataset.id;
+    renderAll();
+  }));
+  el.querySelectorAll('.node-details-btn').forEach(b => b.onclick = (ev) => {
+    ev.stopPropagation();
+    UI.selectedNodeId = b.dataset.id;
+    openNodeModal(b.dataset.id);
+  });
   el.querySelectorAll('.activate-node-btn').forEach(b => b.onclick = (ev) => {
     ev.stopPropagation();
     const res = activatePlannedNode(s, b.dataset.id);
@@ -1651,7 +1863,7 @@ function renderOlbm(s) {
   if (!s.aiAdvice.length) { el.innerHTML = '<div class="card-sub">Geen kritieke adviezen deze fase.</div>'; return; }
   let html = '';
   s.aiAdvice.forEach(a => {
-    html += `<div class="card advice-card ${a.severity}">
+    html += `<div class="card advice-card ${a.severity}" data-unit="${a.unitId || ''}" data-node="${a.nodeId || ''}">
       <div class="advice-title">${a.kind === 'critical' ? '⚠️' : a.kind === 'forecast' ? '📊' : a.kind === 'newnode' ? '🗺️' : a.kind === 'order' ? '📦' : a.kind === 'activate' ? '🔧' : '⚡'} ${a.title}</div>
       <div class="advice-body">${a.body}</div>
       <div class="advice-actions">
@@ -1663,6 +1875,10 @@ function renderOlbm(s) {
   });
   el.innerHTML = html;
   el.querySelectorAll('button[data-act]').forEach(b => b.onclick = () => handleAdviceAction(b.dataset.id, b.dataset.act));
+  el.querySelectorAll('.advice-card').forEach(card => {
+    card.addEventListener('mouseenter', () => { UI.highlightedAdviceUnitId = card.dataset.unit || null; UI.highlightedAdviceNodeId = card.dataset.node || null; });
+    card.addEventListener('mouseleave', () => { UI.highlightedAdviceUnitId = null; UI.highlightedAdviceNodeId = null; });
+  });
 }
 
 function handleAdviceAction(adviceId, act) {
@@ -1680,12 +1896,22 @@ function handleAdviceAction(adviceId, act) {
 
 function renderAlerts(s) {
   const el = document.getElementById('alerts-list');
+  const broken = s.corridors.filter(c => c.status === 'onderbroken');
+  let html = broken.map(c => `<div class="card advice-card crit"><div class="card-title">${c.name} <span class="tag tag-crit">ONDERBROKEN</span></div>
+    <div class="card-sub">&gt;40% uitval in 6u of brug plat — herroutering/escorte aanbevolen.${c.alertAcknowledged ? ' (bevestigd, knippert niet meer)' : ''}</div>
+    ${!c.alertAcknowledged ? `<button class="ack-corridor-btn" data-cor="${c.id}" style="width:100%;margin-top:6px;padding:5px 0;font-size:0.7rem;background:var(--bg-3);border:1px solid var(--border);color:var(--text-0);border-radius:4px;">Bevestigen (stopt knipperen)</button>` : ''}
+  </div>`).join('');
   const crit = olbmCriticalityScan(s);
-  let html = crit.map(c => `<div class="card"><div class="card-title">${c.unit.name.split('(')[0].trim()} <span class="tag tag-crit">${c.shortage}</span></div>
+  html += crit.map(c => `<div class="card"><div class="card-title">${c.unit.name.split('(')[0].trim()} <span class="tag tag-crit">${c.shortage}</span></div>
     <div class="card-sub">Min. voorraad: ${fmt1(Math.min(c.unit.stock.V, c.unit.stock.III, c.unit.stock.I))} dagen</div></div>`).join('');
   const underAttack = s.nodes.filter(n => n.underAttackUntil > s.day);
   html += underAttack.map(n => `<div class="card"><div class="card-title">${n.name} <span class="tag tag-crit">AANVAL</span></div></div>`).join('');
   el.innerHTML = html || '<div class="card-sub">Geen actieve kritieke alerts.</div>';
+  el.querySelectorAll('.ack-corridor-btn').forEach(b => b.onclick = () => {
+    const cor = s.corridors.find(c => c.id === b.dataset.cor);
+    if (cor) cor.alertAcknowledged = true;
+    renderAll();
+  });
 }
 
 function renderEventLog(s) {
@@ -1734,7 +1960,7 @@ function showQuoteTooltip(ev, key) {
 /* ---------------------------------------------------------------------- */
 /* 10. UI / INTERACTIE                                                     */
 /* ---------------------------------------------------------------------- */
-function openNodeModal(nodeId) {
+function openNodeModal(nodeId, presetTargetKey) {
   const s = GameState; const nd = s.nodes.find(n => n.id === nodeId); if (!nd) return;
   if (nd.destroyed) {
     setModal(`
@@ -1781,7 +2007,17 @@ function openNodeModal(nodeId) {
 
   const unitOptions = s.units.filter(u => u.lossesFrac < 1).map(u => `<option value="unit:${u.id}">${u.name.split('(')[0].trim()} (${u.priority})</option>`).join('');
   const nodeOptions = s.nodes.filter(n => n.id !== nd.id && !n.underConstruction && !n.destroyed).map(n => `<option value="node:${n.id}">${n.name}${n.planned && !n.active ? ' (gepland)' : ''}</option>`).join('');
-  const classOptions = Object.keys(nd.stock).map(c => `<option value="${c}">${CLASS_LABEL[c]}</option>`).join('');
+  const classRows = Object.keys(nd.stock).map(c => `
+    <div class="send-class-row" data-cls="${c}" style="margin-bottom:6px;padding:6px;background:var(--bg-2);border:1px solid var(--border);border-radius:4px;">
+      <label style="display:flex;align-items:center;gap:6px;font-size:0.78rem;cursor:pointer;">
+        <input type="checkbox" class="send-cls-check" value="${c}">
+        <span style="flex:1;">${CLASS_LABEL[c]}</span>
+        <span class="send-cls-pct-val" style="width:38px;text-align:right;color:var(--text-dim);">0%</span>
+      </label>
+      <input type="range" class="send-cls-pct" min="0" max="100" value="10" disabled style="width:100%;margin-top:4px;">
+      <div class="card-sub send-cls-amt" style="font-size:0.68rem;margin:2px 0 0;">0t van capaciteit ${Math.round(nd.capacity[c])} · voorraad beschikbaar ${Math.round(nd.stock[c])}</div>
+    </div>
+  `).join('');
 
   setModal(`
     <h2>${nd.name}${nd.isHQ ? ' 🎖 (Kerncommando)' : ''}</h2>
@@ -1789,32 +2025,63 @@ function openNodeModal(nodeId) {
     <table><thead><tr><th>Klasse</th><th>Voorraad / Capaciteit</th></tr></thead><tbody>${rows}</tbody></table>
 
     <h3>Stuur voorraad</h3>
-    <p style="font-size:0.8rem;">Kies bestemming, klasse, hoeveelheid en transportmodus. Het systeem toont ETA en risico voordat je verstuurt.</p>
+    <p style="font-size:0.8rem;">Kies bestemming, een of meer klassen en per klasse de hoeveelheid als percentage van de maximale capaciteit. Het systeem toont ETA en risico voordat je verstuurt.</p>
     <label style="font-size:0.75rem;color:var(--text-dim);">Bestemming</label>
     <select id="send-target" style="width:100%;padding:6px;background:var(--bg-2);color:var(--text-0);border:1px solid var(--border);border-radius:4px;margin-bottom:6px;">
       <optgroup label="Eenheden">${unitOptions}</optgroup>
       <optgroup label="Nodes">${nodeOptions}</optgroup>
     </select>
-    <label style="font-size:0.75rem;color:var(--text-dim);">Klasse</label>
-    <select id="send-class" style="width:100%;padding:6px;background:var(--bg-2);color:var(--text-0);border:1px solid var(--border);border-radius:4px;margin-bottom:6px;">${classOptions}</select>
+    <label style="font-size:0.75rem;color:var(--text-dim);">Klasse(n) &amp; hoeveelheid (% van max. capaciteit)</label>
+    <div id="send-class-rows">${classRows}</div>
     <label style="font-size:0.75rem;color:var(--text-dim);">Transportmodus</label>
     <select id="send-mode" style="width:100%;padding:6px;background:var(--bg-2);color:var(--text-0);border:1px solid var(--border);border-radius:4px;margin-bottom:6px;"></select>
-    <label style="font-size:0.75rem;color:var(--text-dim);">Hoeveelheid: <span id="send-amount-val">0</span></label>
-    <input id="send-amount" type="range" min="1" max="100" value="10" style="width:100%;">
     <p id="send-eta-risk" class="card-sub" style="margin-top:6px;"></p>
     <div class="modal-actions">
       <button id="send-confirm" class="primary">Verstuur</button>
+      <button id="pick-target-map">🗺️ Kies bestemming op kaart</button>
       ${nd.type !== 'hub' ? '<button id="node-relocate">Verplaats node</button>' : ''}
-      <button id="modal-close">Sluiten</button>
     </div>
+
+    <h3>Corridors</h3>
+    ${(() => {
+      const myCors = s.corridors.filter(c => c.nodeChain.includes(nd.id));
+      const list = myCors.length
+        ? myCors.map(c => `<div class="bar-row"><span class="bar-label" style="width:auto;flex:1;">${c.name}${c.underConstruction ? ' 🚧' : ''}</span><button class="unlink-cor-btn" data-cor="${c.id}" style="padding:2px 8px;font-size:0.68rem;">✂️ Loskoppelen</button></div>`).join('')
+        : '<p class="card-sub">Nog geen corridor-verbindingen.</p>';
+      return list;
+    })()}
+    <div class="modal-actions"><button id="node-link-corridor">🔗 Corridor koppelen vanaf hier</button></div>
+    <div class="modal-actions"><button id="modal-close">Sluiten</button></div>
   `);
   document.getElementById('modal-close').onclick = closeModal;
+  document.getElementById('node-link-corridor').onclick = () => {
+    UI.corridorLinkFromId = nd.id;
+    s.messages.push(mkMsg(`Klik een andere node op de kaart om een corridor aan te leggen vanaf ${nd.name}.`));
+    closeModal(); renderAll();
+  };
+  document.querySelectorAll('.unlink-cor-btn').forEach(b => b.onclick = () => {
+    removeNodeFromCorridor(s, b.dataset.cor, nd.id);
+    closeModal(); renderAll();
+  });
+  document.getElementById('pick-target-map').onclick = () => {
+    UI.pickingSupplyTargetForNodeId = nd.id;
+    s.messages.push(mkMsg('Klik een eenheid of node op de kaart als bestemming.'));
+    closeModal(); renderAll();
+  };
 
   function currentTarget() {
     const val = document.getElementById('send-target').value;
     if (!val) return null;
     const [type, id] = val.split(':');
     return { targetType: type, target: type === 'unit' ? s.units.find(u => u.id === id) : s.nodes.find(n => n.id === id) };
+  }
+  function selectedClassAmounts() {
+    return Array.from(document.querySelectorAll('.send-class-row')).filter(row => row.querySelector('.send-cls-check').checked).map(row => {
+      const cls = row.dataset.cls;
+      const pct = Number(row.querySelector('.send-cls-pct').value);
+      const amt = clamp(nd.capacity[cls] * pct / 100, 0, nd.stock[cls] || 0);
+      return { cls, pct, amt };
+    });
   }
   function refreshModes() {
     const { targetType, target } = currentTarget() || {};
@@ -1827,32 +2094,48 @@ function openNodeModal(nodeId) {
   function refreshEtaRisk() {
     const { targetType, target } = currentTarget() || {};
     const mode = document.getElementById('send-mode').value;
-    const cls = document.getElementById('send-class').value;
-    const amt = Number(document.getElementById('send-amount').value);
-    document.getElementById('send-amount-val').textContent = amt;
-    if (!target || !mode) { document.getElementById('send-eta-risk').textContent = ''; return; }
+    document.querySelectorAll('.send-class-row').forEach(row => {
+      const cls = row.dataset.cls;
+      const checked = row.querySelector('.send-cls-check').checked;
+      const pctInput = row.querySelector('.send-cls-pct');
+      pctInput.disabled = !checked;
+      const pct = Number(pctInput.value);
+      row.querySelector('.send-cls-pct-val').textContent = `${pct}%`;
+      const amt = clamp(nd.capacity[cls] * pct / 100, 0, nd.stock[cls] || 0);
+      row.querySelector('.send-cls-amt').textContent = `${fmt1(amt)}t van capaciteit ${Math.round(nd.capacity[cls])} · voorraad beschikbaar ${Math.round(nd.stock[cls])}`;
+    });
+    const picks = selectedClassAmounts();
+    if (!target || !mode || !picks.length) {
+      document.getElementById('send-eta-risk').textContent = picks.length ? '' : 'Selecteer minimaal één klasse.';
+      return;
+    }
     const { km, eta, risk } = transferEtaRisk(s, nd, target, mode);
-    let txt = `Afstand ${fmt1(km)}km · ETA ${fmt1(eta)}u · risico onderweg ${Math.round(risk * 100)}% · beschikbaar: ${fmt1(nd.stock[cls] || 0)}`;
+    const totalAmt = picks.reduce((a, p) => a + p.amt, 0);
+    let txt = `Afstand ${fmt1(km)}km · ETA ${fmt1(eta)}u · risico onderweg ${Math.round(risk * 100)}% · totaal ${fmt1(totalAmt)}t in ${picks.length} klasse${picks.length > 1 ? 's' : ''}`;
     if (mode === 'vrachtwagen') {
-      const trucksNeeded = Math.max(1, Math.ceil(amt / 20));
+      const trucksNeeded = picks.reduce((a, p) => a + Math.max(1, Math.ceil(p.amt / 20)), 0);
       txt += ` · vrachtwagens nodig: ${trucksNeeded} (pool: ${s.transport.trucks}/${s.transport.trucksMax})`;
     }
     document.getElementById('send-eta-risk').textContent = txt;
   }
   document.getElementById('send-target').oninput = refreshModes;
-  document.getElementById('send-class').oninput = refreshEtaRisk;
   document.getElementById('send-mode').oninput = refreshEtaRisk;
-  document.getElementById('send-amount').oninput = refreshEtaRisk;
+  document.querySelectorAll('.send-cls-check').forEach(cb => cb.onchange = refreshEtaRisk);
+  document.querySelectorAll('.send-cls-pct').forEach(sl => sl.oninput = refreshEtaRisk);
+  if (presetTargetKey && document.querySelector(`#send-target option[value="${presetTargetKey}"]`)) {
+    document.getElementById('send-target').value = presetTargetKey;
+  }
   refreshModes();
 
   document.getElementById('send-confirm').onclick = () => {
     const { targetType, target } = currentTarget() || {};
     const mode = document.getElementById('send-mode').value;
-    const cls = document.getElementById('send-class').value;
-    const amt = Number(document.getElementById('send-amount').value);
-    if (!target || !mode) return;
-    const res = sendSupply(s, nd.id, target.id, targetType, cls, amt, mode);
-    if (!res.ok) s.messages.push(mkMsg(res.msg, 'crit'));
+    const picks = selectedClassAmounts();
+    if (!target || !mode || !picks.length) return;
+    picks.forEach(({ cls, amt }) => {
+      const res = sendSupply(s, nd.id, target.id, targetType, cls, amt, mode);
+      if (!res.ok) s.messages.push(mkMsg(`${CLASS_LABEL[cls]}: ${res.msg}`, 'crit'));
+    });
     closeModal(); renderAll();
   };
   const relocBtn = document.getElementById('node-relocate');
@@ -1899,14 +2182,25 @@ function openUnitModal(unitId) {
   if (reqBtn) reqBtn.onclick = () => { closeModal(); openNodeModal(nearest.id); };
 }
 
+const CORRIDOR_MODE_LABEL = { spoor: 'Spoorweg', weg: 'Weg', water: 'Water (pontonbrug)' };
+
 function openCorridorModal(corridorId) {
   const s = GameState; const cor = s.corridors.find(c => c.id === corridorId); if (!cor) return;
+  if (cor.underConstruction) {
+    setModal(`
+      <h2>${cor.name}</h2>
+      <p>🚧 In aanleg (${CORRIDOR_MODE_LABEL[cor.mode] || cor.mode}) — klaar over ${Math.max(0, Math.round((cor.constructionCompletePhase - absPhase(s)) * CFG.PHASE_HOURS))}u.</p>
+      <div class="modal-actions"><button id="modal-close" class="primary">Sluiten</button></div>
+    `);
+    document.getElementById('modal-close').onclick = closeModal;
+    return;
+  }
   const chainNames = cor.nodeChain.map(id => s.nodes.find(n => n.id === id)).filter(Boolean).map(n => n.name).join(' → ');
   const bridgeDown = cor.bridgeDownUntil && cor.bridgeDownUntil > s.day;
   const escorted = cor.escortUntil && cor.escortUntil > absPhase(s);
   setModal(`
     <h2>${cor.name}</h2>
-    <p>Status: <strong>${cor.status}</strong> · Modus: ${cor.mode} · Kwetsbaarheid: ${Math.round(cor.vulnerability * 100)}%${escorted ? ' · 🛡 escorte actief' : ''}${bridgeDown ? ` · brug plat tot dag ${cor.bridgeDownUntil}` : ''}</p>
+    <p>Status: <strong>${cor.status}</strong> · Modus: ${CORRIDOR_MODE_LABEL[cor.mode] || cor.mode} · Kwetsbaarheid: ${Math.round(cor.vulnerability * 100)}%${escorted ? ' · 🛡 escorte actief' : ''}${bridgeDown ? ` · brug plat tot dag ${cor.bridgeDownUntil}` : ''}</p>
     <p class="card-sub">Keten: ${chainNames}</p>
     <h3>Acties</h3>
     <p style="font-size:0.8rem;">Een escorte verlaagt de kwetsbaarheid direct, maar bindt een pantser/artillerie-eenheid 24u (die kan dan niet oprukken). Herrouteren verdeelt de last over een naburige corridor.</p>
@@ -1914,11 +2208,13 @@ function openCorridorModal(corridorId) {
       <button id="cor-escort" class="primary">Wijs escorte toe</button>
       <button id="cor-reroute">Herrouteer via secundaire corridor</button>
     </div>
+    <div class="modal-actions"><button id="cor-delete" class="danger">🗑 Corridor opheffen</button></div>
     <div class="modal-actions"><button id="modal-close">Sluiten</button></div>
   `);
   document.getElementById('modal-close').onclick = closeModal;
   document.getElementById('cor-escort').onclick = () => { const r = assignEscort(s, cor.id); if (!r.ok) s.messages.push(mkMsg(r.msg, 'crit')); closeModal(); renderAll(); };
   document.getElementById('cor-reroute').onclick = () => { const r = rerouteCorridor(s, cor.id); if (!r.ok) s.messages.push(mkMsg(r.msg, 'crit')); closeModal(); renderAll(); };
+  document.getElementById('cor-delete').onclick = () => { deleteCorridor(s, cor.id); closeModal(); renderAll(); };
 }
 
 function openBuildNodeChooser() {
@@ -2086,16 +2382,76 @@ function pxToGrid(s, mx, my) {
   return { gx: clamp((mx - MAP_PAD.l) / cellW, 0, s.gridW - 1), gy: clamp((my - MAP_PAD.t) / cellH, 0, s.gridH - 1) };
 }
 
+/* ---- Rechtsklik-contextmenu op een node: corridor koppelen/loskoppelen ---- */
+function removeContextMenu() {
+  const el = document.getElementById('ctx-menu'); if (el) el.remove();
+  document.removeEventListener('click', removeContextMenuOnce, { capture: true });
+}
+function removeContextMenuOnce() { removeContextMenu(); }
+
+function showNodeContextMenu(ev, nodeId) {
+  removeContextMenu();
+  const s = GameState; const nd = s.nodes.find(n => n.id === nodeId); if (!nd) return;
+  let html = `<div class="ctx-title">${nd.name}</div>`;
+  if (nodeUsable(nd)) html += `<button data-act="link">🔗 Corridor koppelen vanaf hier</button>`;
+  const myCors = s.corridors.filter(c => c.nodeChain.includes(nodeId));
+  myCors.forEach(c => { html += `<button data-act="unlink" data-cor="${c.id}">✂️ Loskoppelen van ${c.name}</button>`; });
+  if (!nodeUsable(nd) && !myCors.length) html += `<div class="ctx-empty">Geen acties beschikbaar</div>`;
+  const menu = document.createElement('div');
+  menu.id = 'ctx-menu'; menu.className = 'ctx-menu';
+  menu.innerHTML = html;
+  document.body.appendChild(menu);
+  const wrapRect = document.getElementById('map-wrap').getBoundingClientRect();
+  const mw = menu.offsetWidth, mh = menu.offsetHeight;
+  let left = ev.clientX, top = ev.clientY;
+  if (left + mw > wrapRect.right - 6) left = ev.clientX - mw;
+  if (top + mh > wrapRect.bottom - 6) top = ev.clientY - mh;
+  menu.style.left = left + 'px'; menu.style.top = top + 'px';
+  menu.querySelector('[data-act="link"]')?.addEventListener('click', () => {
+    UI.corridorLinkFromId = nodeId;
+    s.messages.push(mkMsg(`Klik een andere node op de kaart om een corridor aan te leggen vanaf ${nd.name}.`));
+    removeContextMenu(); renderAll();
+  });
+  menu.querySelectorAll('[data-act="unlink"]').forEach(b => b.addEventListener('click', () => {
+    removeNodeFromCorridor(s, b.dataset.cor, nodeId);
+    removeContextMenu(); renderAll();
+  }));
+  setTimeout(() => document.addEventListener('click', removeContextMenuOnce, { capture: true }), 0);
+}
+
 function wireCanvasInteraction() {
   const canvas = document.getElementById('map-canvas');
   const tooltip = document.getElementById('map-tooltip');
+  canvas.addEventListener('contextmenu', (ev) => {
+    ev.preventDefault();
+    const s = GameState; if (!s || s.stage !== 'operation') return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+    const hit = hitTestMap(s, mx, my);
+    if (hit && hit.type === 'node') showNodeContextMenu(ev, hit.obj.id);
+  });
   canvas.addEventListener('mousemove', (ev) => {
     const s = GameState; if (!s) return;
     const rect = canvas.getBoundingClientRect();
     const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
     const hit = hitTestMap(s, mx, my);
     UI.hoveredNodeId = (hit && hit.type === 'node') ? hit.obj.id : null;
-    if (UI.relocatingNodeId || UI.buildingNodeType || UI.placingPlannedType) { canvas.style.cursor = 'crosshair'; tooltip.classList.add('hidden'); return; }
+    UI.hoveredUnitId = (hit && hit.type === 'unit') ? hit.obj.id : null;
+    if (UI.relocatingNodeId || UI.buildingNodeType || UI.placingPlannedType) {
+      canvas.style.cursor = 'crosshair';
+      const { gx, gy } = pxToGrid(s, mx, my);
+      const terrain = terrainAt(s, gx, gy);
+      const river = terrain === 'rivier';
+      const estVuln = terrainVulnerability(s, gx, gy);
+      const hubDist = nearestNode(s, { x: gx, y: gy }, null);
+      let html = `<strong>${TERRAIN[terrain].label}</strong>`;
+      html += river ? `<br><span style="color:#ff3333;">⛔ Niet geldig — kies een oeverpunt.</span>` :
+        `<br>Geschatte kwetsbaarheid: ~${Math.round(estVuln * 100)}%<br>Dichtstbijzijnde node: ${hubDist.node ? `${hubDist.node.name} (${fmt1(hubDist.km)}km)` : '—'}`;
+      tooltip.innerHTML = html;
+      positionMapTooltip(ev.clientX, ev.clientY);
+      return;
+    }
+    if (UI.corridorLinkFromId || UI.pickingSupplyTargetForNodeId) canvas.style.cursor = 'crosshair';
     if (hit) {
       if (hit.type === 'node') {
         let html = `<strong>${hit.obj.name}</strong><br>${NODE_TYPES[hit.obj.type].label}${hit.obj.destroyed ? ' · ☠ verwoest' : hit.obj.planned && !hit.obj.active ? ' · 📋 gepland' : hit.obj.underConstruction ? ' · 🚧 in aanbouw' : ''}`;
@@ -2108,7 +2464,11 @@ function wireCanvasInteraction() {
         }
         tooltip.innerHTML = html;
       }
-      else if (hit.type === 'unit') tooltip.innerHTML = `<strong>${hit.obj.name}</strong><br>Status: ${hit.obj.status} · Moraal: ${Math.round(hit.obj.morale)}% · Prio: ${hit.obj.priority}`;
+      else if (hit.type === 'unit') {
+        const remainingKm = dist(hit.obj, hit.obj.destination);
+        const etaDays = fmt1(remainingKm / Math.max(5, UNIT_TYPES[hit.obj.type].speedKmDag));
+        tooltip.innerHTML = `<strong>${hit.obj.name}</strong><br>Status: ${hit.obj.status} · Moraal: ${Math.round(hit.obj.morale)}% · Prio: ${hit.obj.priority}<br><em>Objectief:</em> ${remainingKm >= 1 ? `${fmt1(remainingKm)}km resterend, ETA ±${etaDays}d` : 'bereikt'}`;
+      }
       else tooltip.innerHTML = `<strong>${hit.obj.name}</strong><br>Status: ${hit.obj.status} · Kwetsbaarheid ${Math.round(hit.obj.vulnerability * 100)}%`;
       positionMapTooltip(ev.clientX, ev.clientY);
       canvas.style.cursor = 'pointer';
@@ -2119,9 +2479,36 @@ function wireCanvasInteraction() {
     const rect = canvas.getBoundingClientRect();
     const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
 
+    if (UI.corridorLinkFromId) {
+      const fromId = UI.corridorLinkFromId;
+      UI.corridorLinkFromId = null;
+      const hit = hitTestMap(s, mx, my);
+      if (hit && hit.type === 'node') {
+        const res = completeCorridorLink(s, fromId, hit.obj.id);
+        if (!res.ok) s.messages.push(mkMsg(res.msg, 'crit'));
+      } else {
+        s.messages.push(mkMsg('Corridor-aanleg geannuleerd.'));
+      }
+      renderAll();
+      return;
+    }
+    if (UI.pickingSupplyTargetForNodeId) {
+      const sourceId = UI.pickingSupplyTargetForNodeId;
+      UI.pickingSupplyTargetForNodeId = null;
+      const hit = hitTestMap(s, mx, my);
+      if (hit && (hit.type === 'node' || hit.type === 'unit') && hit.obj.id !== sourceId) {
+        openNodeModal(sourceId, (hit.type === 'node' ? 'node:' : 'unit:') + hit.obj.id);
+      } else {
+        s.messages.push(mkMsg('Bestemmingskeuze geannuleerd.'));
+        openNodeModal(sourceId);
+      }
+      return;
+    }
+
     if (s.stage === 'planning') {
       if (UI.placingPlannedType) {
         const { gx, gy } = pxToGrid(s, mx, my);
+        if (isRiverTile(s, gx, gy)) { s.messages.push(mkMsg('Kan geen node op een rivier plaatsen — kies een oeverpunt.', 'crit')); return; }
         const nd = mkPlannedNode(s, UI.placingPlannedType, gx, gy, s.nodes.length + 1);
         s.messages.push(mkMsg(`Locatie gepland: ${nd.name}.`));
         UI.placingPlannedType = null;
@@ -2140,6 +2527,7 @@ function wireCanvasInteraction() {
 
     if (UI.placingPlannedType) {
       const { gx, gy } = pxToGrid(s, mx, my);
+      if (isRiverTile(s, gx, gy)) { s.messages.push(mkMsg('Kan geen node op een rivier plaatsen — kies een oeverpunt.', 'crit')); return; }
       const nd = mkPlannedNode(s, UI.placingPlannedType, gx, gy, s.nodes.length + 1);
       s.messages.push(mkMsg(`Locatie gepland: ${nd.name}. Stuur er tijdens de operatie voorraad heen om te activeren.`));
       UI.placingPlannedType = null;
@@ -2251,16 +2639,16 @@ function showRulesModal() {
     <h3>Vraag-gestuurde bevoorrading</h3>
     <p>Eenheden bevoorraden zichzelf niet stilzwijgend meer. Zodra een klasse onder de norm zakt, genereert de eenheid een <strong>bestelling</strong> — vaak meerdere klassen tegelijk — die automatisch wordt gericht op de dichtstbijzijnde node die kan leveren. Standaard verschijnt die bestelling als een 📦 BEVOORRADINGSAANVRAAG in het OLBM-paneel: jij accepteert, past aan (percentage) of negeert. Zet in het eenheidsvenster "🤖 AI beheert bestellingen automatisch" aan om dat per eenheid te delegeren — dan wordt er direct verzonden zodra er een tekort ontstaat, zonder tussenkomst.</p>
     <h3>Zes soorten besluiten</h3>
-    <p><strong>A. Voorraden verplaatsen</strong> — klik een node op de kaart, kies bestemming, klasse, hoeveelheid en transportmodus (spoor/vrachtwagen/helikopter/drone). ETA en onderweg-risico worden live getoond voordat je verstuurt. Dit is ook hoe je een geplande node activeert. Hover over een node om te zien welke eenheden hij momenteel bevoorraadt.</p>
-    <p><strong>B. Depots bouwen of verplaatsen</strong> — twee routes, ook tijdens de operatie: "📍 Locatie plannen" (gratis, activeer later via een konvooi — net als in de planningsfase) of "🏗 Nieuwe node bouwen" (directe kost + gegarandeerde bouwtijd, voor een spoedlocatie). Elke geactiveerde node (behalve de vaste spoorweghubs) kan verplaatst worden mét resterende voorraad — evacuatieverlies hangt af van het type (mobiele micro-depots verplaatsen het makkelijkst).</p>
-    <p><strong>C. Prioriteiten stellen</strong> — klik een eenheid en zet P1 (kritiek) t/m P4 (laag). Hogere prioriteit krijgt voorrang bij schaarse transportcapaciteit en weegt zwaarder in AI-adviezen.</p>
-    <p><strong>D. Corridors beveiligen of herrouteren</strong> — klik een corridorlijn op de kaart: wijs een escorte toe (verlaagt kwetsbaarheid, bindt een pantser/artillerie-eenheid 24u) of herrouteer via een naburige corridor.</p>
-    <p><strong>E. AI-advies beoordelen</strong> — het OLBM-paneel rechts geeft elke fase adviezen, inclusief bevoorradingsaanvragen. Per advies: <strong>Accept</strong> (exact uitvoeren), <strong>Adjust</strong> (percentage aanpassen), of <strong>Ignore</strong>. Genegeerde adviezen tellen mee in je Decision Debt, geëvalueerd in de einddebriefing.</p>
+    <p><strong>A. Voorraden verplaatsen</strong> — klik een node op de kaart, vink één of meer klassen aan en kies per klasse de hoeveelheid als percentage van de maximale capaciteit, en kies een transportmodus. Voor de bestemming kun je uit een lijst kiezen óf op "🗺️ Kies bestemming op kaart" klikken en de bestemming direct aanwijzen (geldige doelen lichten geel op). ETA en onderweg-risico worden live getoond voordat je verstuurt; elke aangevinkte klasse wordt als apart konvooi verstuurd. Dit is ook hoe je een geplande node activeert. Hover over een node om te zien welke eenheden hij momenteel bevoorraadt.</p>
+    <p><strong>B. Depots bouwen of verplaatsen</strong> — twee routes, ook tijdens de operatie: "📍 Locatie plannen" (gratis, activeer later via een konvooi — net als in de planningsfase) of "🏗 Nieuwe node bouwen" (directe kost + gegarandeerde bouwtijd, voor een spoedlocatie). Terrein telt mee: bos/heuvel geven dekking (lagere kwetsbaarheid), open veld is blootgesteld, en op een rivier kun je niet bouwen. Tijdens het plaatsen zie je een live preview (terrein, geschatte kwetsbaarheid, afstand tot dichtstbijzijnde node). Elke geactiveerde node (behalve de vaste spoorweghubs) kan verplaatst worden mét resterende voorraad — evacuatieverlies hangt af van het type (mobiele micro-depots verplaatsen het makkelijkst).</p>
+    <p><strong>C. Prioriteiten stellen</strong> — klik een eenheid en zet P1 (kritiek) t/m P4 (laag). Hogere prioriteit krijgt voorrang bij schaarse transportcapaciteit en weegt zwaarder in AI-adviezen. Hover over een eenheid om zijn objectief (bestemming, resterende afstand, ETA) te zien.</p>
+    <p><strong>D. Corridors aanleggen, beveiligen of herrouteren</strong> — <strong>rechtsklik</strong> een node voor een contextmenu: "Corridor koppelen vanaf hier" (klik daarna een tweede node om te verbinden — modus spoor/weg/water wordt automatisch bepaald) of "Loskoppelen" van een bestaande corridor. Zelfde acties staan ook als knoppen in het node-venster. Een handmatig aangelegde corridor kost tijd en materiaal (net als het bouwen van een node); de gratis basisverbinding die een nieuwe node automatisch krijgt bij activatie is puur minimale bereikbaarheid. Linkerklik op een corridorlijn: wijs een escorte toe, herrouteer, of hef de corridor op.</p>
+    <p><strong>E. AI-advies beoordelen</strong> — het OLBM-paneel rechts geeft elke fase adviezen, inclusief bevoorradingsaanvragen. Hover over een adviescard om de betrokken eenheid/node te laten oplichten op de kaart. Per advies: <strong>Accept</strong> (exact uitvoeren), <strong>Adjust</strong> (percentage aanpassen), of <strong>Ignore</strong>. Genegeerde adviezen tellen mee in je Decision Debt, geëvalueerd in de einddebriefing.</p>
     <p><strong>F. Strategische directives</strong> — elke 10 dagen een keuze van hoger commando. Accepteren geeft politiek krediet maar verhoogt logistiek risico; weigeren is veiliger maar kost krediet. Onder 20% krediet word je vervangen als J-4.</p>
     <h3>Transportcapaciteit</h3>
     <p>Vrachtwagen-konvooien putten uit een gedeelde, eindige pool (Transport-tab, ~20 ton/wagen). Elke 5 dagen komt er via productie in het thuisland een kleine aanvulling bij. Vijandelijke aanvallen op corridors, nodes of konvooien-in-transit schakelen vrachtwagens permanent uit — de pool krimpt dan blijvend. Zonder beschikbare wagens wordt een vrachtwagen-verzending geweigerd (probeer een andere modus of wacht op capaciteit).</p>
     <h3>Degradatie zonder bevoorrading</h3>
-    <p>&gt;24u zonder Class I (rantsoenen): moraal daalt, desertierisico. &gt;24u zonder Class III (brandstof): voertuigen en drones staan stil. &gt;12u zonder Class V (munitie) in contact: eenheid moet terugvallen. &gt;6u zonder Class VIII (medisch) met gewonden: verliezen lopen op. Elke vijandelijke actie (op een corridor, node of eenheid) wordt minstens 1 speldag op de kaart gemarkeerd; een eigen eenheid die volledig is uitgeschakeld, een gedetecteerde vijandelijke eenheid die wordt vernietigd, of een node die is verwoest, blijft daarna <strong>permanent</strong> gemarkeerd op de kaart — dat verlies is definitief voor de rest van het offensief.</p>
+    <p>&gt;24u zonder Class I (rantsoenen): moraal daalt, desertierisico. &gt;24u zonder Class III (brandstof): voertuigen en drones staan stil. &gt;12u zonder Class V (munitie) in contact: eenheid moet terugvallen. &gt;6u zonder Class VIII (medisch) met gewonden: verliezen lopen op. Elke vijandelijke actie (op een corridor, node of eenheid) wordt minstens 1 speldag op de kaart gemarkeerd; een eigen eenheid die volledig is uitgeschakeld, een gedetecteerde vijandelijke eenheid die wordt vernietigd, of een node die is verwoest, blijft daarna <strong>permanent</strong> gemarkeerd op de kaart — dat verlies is definitief voor de rest van het offensief. Een onderbroken corridor knippert op de kaart totdat je hem bevestigt in de Alerts-tab (hij blijft daarna rood zolang hij écht kapot is, maar knippert niet meer).</p>
     <h3>Win- en verliesvoorwaarden</h3>
     <p><strong>Winnen:</strong> Objectief OMEGA bereikt binnen 90 dagen, mét &lt;30% logistiek transportverlies, &lt;50% personeelsverlies, en politiek krediet &gt;20%.<br>
     <strong>Verliezen:</strong> 90 dagen verstreken zonder OMEGA · &gt;50% personeelsverlies · politiek krediet ≤20% (vervangen als J-4) · kerncommando (HQ) vernietigd · OMEGA bereikt maar met te hoog transportverlies (Pyrrusoverwinning).</p>
@@ -2295,9 +2683,14 @@ function showLegendModal() {
   html += `<div class="legend-section-title">Corridors</div><div class="legend-grid">`;
   html += legendRow(`<div class="legend-swatch line" style="background:#4caf50"></div>`, 'Groen — veilig', 'Normale doorvoer, lage kwetsbaarheid.');
   html += legendRow(`<div class="legend-swatch line" style="background:#ffbf00"></div>`, 'Oranje — onder druk', 'Kwetsbaarheid &gt;35% — merkbaar transportverlies.');
-  html += legendRow(`<div class="legend-swatch line" style="background:#ff3333"></div>`, 'Rood — onderbroken', '&gt;40% uitval in 6u: collapse-alert, herroutering nodig.');
-  html += legendRow(`<div class="legend-swatch line" style="background:#6fa8dc;height:5px;"></div>`, 'Dikke lijn / dunne lijn', 'Dik = spoorweg (hoge capaciteit), dun = wegtransport.');
+  html += legendRow(`<div class="legend-swatch line" style="background:#ff3333"></div>`, 'Rood, knipperend', 'Onderbroken (&gt;40% uitval in 6u) — knippert tot bevestigd in de Alerts-tab; blijft daarna rood staan zolang echt kapot.');
+  html += legendRow(`<div class="legend-swatch line" style="background:#c8c8c8;height:5px;"></div>`, 'Dikke effen lijn', 'Spoorweg — hoge capaciteit, alleen tussen hubs/distributiepunten.');
+  html += legendRow(`<div class="legend-swatch line" style="background:#a87d4f;height:3px;"></div>`, 'Dunne effen lijn', 'Weg — standaard, overal mogelijk.');
+  html += legendRow(`<div class="legend-swatch line" style="background:#4aa3d1;height:4px;border-top:2px dashed #0c0d0a;"></div>`, 'Gestippelde blauwe lijn', 'Water/pontonbrug — waar een corridor een rivier kruist, lage capaciteit.');
+  html += legendRow(`<div class="legend-swatch line" style="background:#ffbf00;height:3px;opacity:.5;"></div>`, 'Gedimd + gestippeld amber', 'Corridor in aanleg — nog niet operationeel.');
   html += legendRow(`🛡`, 'Schild-icoon op de lijn', 'Escorte actief — kwetsbaarheid verlaagd, één eenheid 24u gebonden.');
+  html += legendRow(`<div class="legend-swatch round" style="background:#4caf50;width:6px;height:6px;"></div>`, 'Kleine gedimde stip langs een lijn', 'Achtergrondstroom — automatische hub→node-doorvoer, kleur = klasse.');
+  html += legendRow(`🖱️`, 'Rechtsklik op een node', 'Contextmenu: corridor koppelen vanaf hier, of loskoppelen van een bestaande corridor. Tijdens het koppelen lichten geldige doelen geel op.');
   html += `</div>`;
 
   html += `<div class="legend-section-title">Eenheden</div><div class="legend-grid">`;
@@ -2310,6 +2703,8 @@ function showLegendModal() {
   html += legendRow(`<span style="color:#6b6b6b;font-weight:bold;font-size:14px;">✕</span>`, 'Grijs kruis', 'Eigen eenheid volledig uitgeschakeld — permanent, blijft zichtbaar op de plek waar dit gebeurde.');
   html += legendRow(`<span style="color:#7a1f1f;font-weight:bold;font-size:14px;">✕</span>`, 'Donkerrood kruis', 'Gedetecteerde vijandelijke eenheid vernietigd — permanent zichtbaar.');
   html += legendRow(`<div class="legend-swatch" style="border:2px dashed #87ceeb;background:transparent;"></div>`, 'Stippellijnen bij hover op node', 'Toont welke eenheden deze node bevoorraadt: blauw = primaire leverancier, amber (🚚) = konvooi nu onderweg.');
+  html += legendRow(`<div class="legend-swatch" style="border-bottom:2px dotted #87ceeb;background:transparent;height:8px;"></div>`, 'Stippellijn bij hover op eenheid', 'Toont het objectief (bestemming) van de eenheid, met een puntje op de eindbestemming.');
+  html += legendRow(`<div class="legend-swatch round" style="border:2px solid #87ceeb;background:transparent;"></div>`, 'Pulserende lichtblauwe ring', 'Deze eenheid of node wordt genoemd in het OLBM-advies waarover je hovert.');
   html += `</div>`;
 
   html += `<div class="legend-section-title">Event- &amp; aanvalsmarkeringen</div><div class="legend-grid">`;
@@ -2346,7 +2741,7 @@ const TOUR_STEPS = [
   { sel: '#header', title: 'Header', text: 'Dag, fase, weer, scenario en politiek krediet. Rechts: de "?"-knop (deze legenda), pauze, opslaan en terug naar menu.' },
   { sel: '#ooda-bar', title: 'OODA-statusbalk', text: 'Observe/Orient tonen hoe vers en betrouwbaar je informatiebeeld is. Decide is jouw beslistijd per fase — de aftellende klok. Act toont de uitvoering.' },
   { sel: '#panel-left', title: 'Linkerpaneel — de pijplijn', text: 'Supply Flow, het Class I–X dashboard, transportcapaciteit per corridor, en de nodelijst — hier bouw je ook nieuwe depots.' },
-  { sel: '#map-wrap', title: 'De kaart', text: 'Klik een node om voorraad te sturen, een eenheid om een prioriteit te zetten, of een corridorlijn om escorte/herroutering te regelen. Gestippelde cirkels zijn geplande, nog niet geactiveerde nodes. Boven en links staan coördinaatassen in km vanaf de startlijn. Grijze waas = onverkend gebied.' },
+  { sel: '#map-wrap', title: 'De kaart', text: 'Klik een node om voorraad te sturen, een eenheid om een prioriteit te zetten, of een corridorlijn om escorte/herroutering te regelen. Rechtsklik een node om een corridor te koppelen of los te koppelen. Gestippelde cirkels zijn geplande, nog niet geactiveerde nodes. Boven en links staan coördinaatassen in km vanaf de startlijn. Grijze waas = onverkend gebied.' },
   { sel: '#panel-right', title: 'Rechterpaneel — OLBM', text: 'AI-advies per fase: Accept, Adjust (percentage aanpassen) of Ignore. Genegeerde adviezen tellen mee in je Decision Debt, terug te zien in de eindrapportage.' },
   { sel: '#footer', title: 'Footer', text: 'Berichtenstream met recente gebeurtenissen, en de snelheidsregelaar (pauze t/m 10×).' },
 ];
@@ -2389,7 +2784,7 @@ function runTour(i) {
 function startDemo() {
   GameState = newGameState('lange_mars', 'cadet', null);
   GameState.demoMode = true;
-  UI = { activeLeftTab: 'flow', activeRightTab: 'olbm', selectedNodeId: null, selectedUnitId: null, selectedCorridorId: null, relocatingNodeId: null, buildingNodeType: null, placingPlannedType: null, hoveredNodeId: null, speed: 0, paused: true, lastTick: 0, phaseElapsed: 0 };
+  UI = { activeLeftTab: 'flow', activeRightTab: 'olbm', selectedNodeId: null, selectedUnitId: null, selectedCorridorId: null, relocatingNodeId: null, buildingNodeType: null, placingPlannedType: null, hoveredNodeId: null, hoveredUnitId: null, corridorLinkFromId: null, pickingSupplyTargetForNodeId: null, highlightedAdviceUnitId: null, highlightedAdviceNodeId: null, speed: 0, paused: true, lastTick: 0, phaseElapsed: 0 };
   GameState._phaseDecideStart = Date.now();
   goToGameScreen();
   setTimeout(() => runTour(0), 250);
@@ -2413,7 +2808,7 @@ function buildMenu() {
 
 function startGame(scenarioId, difficultyId, sandboxOpts) {
   GameState = newGameState(scenarioId, difficultyId, sandboxOpts);
-  UI = { activeLeftTab: 'flow', activeRightTab: 'olbm', selectedNodeId: null, selectedUnitId: null, selectedCorridorId: null, relocatingNodeId: null, buildingNodeType: null, placingPlannedType: null, hoveredNodeId: null, speed: 1, paused: false, lastTick: 0, phaseElapsed: 0 };
+  UI = { activeLeftTab: 'flow', activeRightTab: 'olbm', selectedNodeId: null, selectedUnitId: null, selectedCorridorId: null, relocatingNodeId: null, buildingNodeType: null, placingPlannedType: null, hoveredNodeId: null, hoveredUnitId: null, corridorLinkFromId: null, pickingSupplyTargetForNodeId: null, highlightedAdviceUnitId: null, highlightedAdviceNodeId: null, speed: 1, paused: false, lastTick: 0, phaseElapsed: 0 };
   GameState._phaseDecideStart = Date.now();
   goToGameScreen();
 }

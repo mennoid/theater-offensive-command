@@ -171,10 +171,6 @@ input { font-family: var(--font-sans); }
   color: var(--text-0); line-height: 1.5;
 }
 
-#corridor-collapse-alert {
-  position: absolute; top: 0; left: 0; right: 0; text-align: center; padding: 10px; background: rgba(255,51,51,0.85);
-  color: #fff; font-weight: bold; letter-spacing: 2px; font-family: var(--font-mono); animation: pulse-red 1s infinite; z-index: 30;
-}
 @keyframes pulse-red { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
 
 #footer { flex: 0 0 auto; display: flex; align-items: center; gap: 16px; padding: 6px 14px; background: var(--bg-1); border-top: 1px solid var(--border); }
@@ -185,6 +181,8 @@ input { font-family: var(--font-sans); }
 
 /* ---------------- Generic data widgets ---------------- */
 .card { background: var(--bg-2); border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px; margin-bottom: 8px; font-size: 0.78rem; }
+.node-row { cursor: pointer; }
+.node-row.selected { border-color: var(--amber); box-shadow: 0 0 0 1px var(--amber) inset; }
 .card-title { font-weight: 600; color: var(--text-0); display: flex; justify-content: space-between; align-items: center; }
 .card-sub { color: var(--text-dim); font-size: 0.7rem; margin-top: 2px; }
 .bar-row { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
@@ -234,6 +232,19 @@ input { font-family: var(--font-sans); }
 
 /* guided tour spotlight */
 .tour-spot { position: fixed; border: 2px solid var(--amber); border-radius: 6px; box-shadow: 0 0 0 9999px rgba(0,0,0,0.78); pointer-events: none; transition: all .25s ease; z-index: 200; }
+
+/* rechtsklik-contextmenu */
+.ctx-menu {
+  position: fixed; z-index: 220; background: var(--bg-1); border: 1px solid var(--olive-light); border-radius: 6px;
+  padding: 6px; min-width: 220px; box-shadow: 0 4px 20px rgba(0,0,0,0.6); display: flex; flex-direction: column; gap: 3px;
+}
+.ctx-menu .ctx-title { font-size: 0.7rem; color: var(--text-dim); padding: 4px 8px; border-bottom: 1px solid var(--border); margin-bottom: 2px; }
+.ctx-menu button {
+  background: var(--bg-2); border: 1px solid var(--border); color: var(--text-0); border-radius: 4px;
+  padding: 7px 10px; font-size: 0.76rem; text-align: left;
+}
+.ctx-menu button:hover { border-color: var(--olive-light); background: var(--bg-3); }
+.ctx-menu .ctx-empty { padding: 6px 8px; font-size: 0.72rem; color: var(--text-dim); }
 .tour-card {
   position: fixed; background: var(--bg-1); border: 1px solid var(--olive-light); border-radius: 6px;
   padding: 16px 20px; max-width: 320px; z-index: 201; box-shadow: 0 0 30px rgba(0,0,0,0.5);
