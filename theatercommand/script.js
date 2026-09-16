@@ -263,6 +263,39 @@ function tryActivateNode(s, nd) {
   }
 }
 
+// Eén-klik activatie: stuurt automatisch konvooien vanaf de dichtstbijzijnde strategische hub
+// (of, als geen hub genoeg voorraad heeft, de dichtstbijzijnde andere bruikbare node) om precies
+// het resterende tekort per activatiedrempel te dekken. De node wordt pas actief zodra de
+// konvooien daadwerkelijk aankomen (resolveConvoys -> tryActivateNode).
+function activatePlannedNode(s, nodeId) {
+  const nd = s.nodes.find(n => n.id === nodeId);
+  if (!nd) return { ok: false, msg: 'Node niet gevonden.' };
+  if (!nd.planned || nd.active) return { ok: false, msg: 'Deze node is niet gepland of al actief.' };
+  const reqs = ACTIVATION_REQ[nd.type] || [];
+  let anySent = false;
+  const failures = [];
+  reqs.forEach(r => {
+    let remaining = r.amt - r.classes.reduce((a, c) => a + (nd.delivered[c] || 0), 0);
+    for (const cls of r.classes) {
+      if (remaining <= 0.01) break;
+      const hubs = s.nodes.filter(n => n.type === 'hub' && nodeUsable(n) && (n.stock[cls] || 0) > 1)
+        .sort((a, b) => dist(a, nd) - dist(b, nd));
+      const source = hubs[0] || nearestNode(s, nd, [cls]).node;
+      if (!source || (source.stock[cls] || 0) <= 0.5) { failures.push(`${CLASS_LABEL[cls]}: geen bevoorrade node gevonden.`); continue; }
+      // Verstuur met marge boven het resterende tekort: onderweg-verlies mag anders de drempel net missen.
+      const amt = Math.min(remaining * 1.3, source.stock[cls] * 0.9);
+      if (amt <= 0.5) { failures.push(`${CLASS_LABEL[cls]}: onvoldoende voorraad bij ${source.name}.`); continue; }
+      const km = dist(source, nd);
+      const mode = km <= CFG.TRUCK_RANGE_KM ? 'vrachtwagen' : 'helikopter';
+      const res = sendSupply(s, source.id, nd.id, 'node', cls, amt, mode);
+      if (res.ok) { anySent = true; remaining -= amt; } else failures.push(`${CLASS_LABEL[cls]}: ${res.msg}`);
+    }
+  });
+  if (!anySent) return { ok: false, msg: failures.length ? failures.join(' ') : 'Niets te versturen — mogelijk al voldoende onderweg.' };
+  s.messages.push(mkMsg(`Activatiekonvooien onderweg naar ${nd.name} vanaf de dichtstbijzijnde hub.`, 'good'));
+  return { ok: true, failures };
+}
+
 // Een vooraf verkende, geplande locatie: geen voorraad, geen logistieke waarde totdat
 // een konvooi arriveert en de activatiedrempel (ACTIVATION_REQ) wordt gehaald.
 function mkPlannedNode(s, type, x, y, n) {
@@ -1588,9 +1621,11 @@ function renderNodeList(s) {
     if (nd.planned && !nd.active) {
       const reqs = ACTIVATION_REQ[nd.type] || [];
       const frac = reqs.length ? reqs.reduce((a, r) => a + clamp(r.classes.reduce((x, c) => x + (nd.delivered[c] || 0), 0) / r.amt, 0, 1), 0) / reqs.length : 0;
-      html += `<div class="card node-row" data-id="${nd.id}" style="cursor:pointer;">
-        <div class="card-title">${nd.name} <span class="tag tag-warn">${Math.round(frac * 100)}% geactiveerd</span></div>
-        <div class="card-sub">${NODE_TYPES[nd.type].label} · 📋 gepland, nog niet operationeel</div></div>`;
+      html += `<div class="card node-row" data-id="${nd.id}">
+        <div class="card-title" style="cursor:pointer;">${nd.name} <span class="tag tag-warn">${Math.round(frac * 100)}% geactiveerd</span></div>
+        <div class="card-sub" style="cursor:pointer;">${NODE_TYPES[nd.type].label} · 📋 gepland, nog niet operationeel</div>
+        <button class="activate-node-btn" data-id="${nd.id}" style="width:100%;margin-top:6px;background:var(--olive);color:#fff;border:1px solid var(--olive-light);border-radius:4px;padding:5px 0;font-size:0.7rem;">⚡ Activeer vanaf dichtstbijzijnde hub</button>
+      </div>`;
       return;
     }
     const avgStock = Object.keys(nd.stock).reduce((a, c) => a + nd.stock[c] / Math.max(1, nd.capacity[c]), 0) / Object.keys(nd.stock).length;
@@ -1602,6 +1637,12 @@ function renderNodeList(s) {
   });
   el.innerHTML = html;
   el.querySelectorAll('.node-row').forEach(r => r.onclick = () => { UI.selectedNodeId = r.dataset.id; openNodeModal(r.dataset.id); });
+  el.querySelectorAll('.activate-node-btn').forEach(b => b.onclick = (ev) => {
+    ev.stopPropagation();
+    const res = activatePlannedNode(s, b.dataset.id);
+    if (!res.ok) s.messages.push(mkMsg(res.msg, 'crit'));
+    renderAll();
+  });
 }
 
 function renderOlbm(s) {
@@ -1722,12 +1763,18 @@ function openNodeModal(nodeId) {
     }).join('');
     setModal(`
       <h2>${nd.name}</h2>
-      <p>📋 <strong>Gepland</strong> — nog niet operationeel. Planning ≠ bezit: pas wanneer een konvooi hier voldoende voorraad aflevert, wordt deze locatie actief. Stuur voorraad vanaf een actieve node via diens "Stuur voorraad"-formulier.</p>
+      <p>📋 <strong>Gepland</strong> — nog niet operationeel. Planning ≠ bezit: pas wanneer een konvooi hier voldoende voorraad aflevert, wordt deze locatie actief.</p>
       <h3>Activatievoortgang</h3>
       ${progressRows || '<p class="card-sub">Geen drempel gedefinieerd.</p>'}
-      <div class="modal-actions"><button id="modal-close" class="primary">Sluiten</button></div>
+      <div class="modal-actions"><button id="modal-activate" class="primary">⚡ Activeer vanaf dichtstbijzijnde hub</button></div>
+      <div class="modal-actions"><button id="modal-close">Sluiten</button></div>
     `);
     document.getElementById('modal-close').onclick = closeModal;
+    document.getElementById('modal-activate').onclick = () => {
+      const res = activatePlannedNode(s, nd.id);
+      if (!res.ok) s.messages.push(mkMsg(res.msg, 'crit'));
+      closeModal(); renderAll();
+    };
     return;
   }
   const rows = Object.keys(nd.stock).map(c => `<tr><td>${CLASS_LABEL[c]}</td><td>${Math.round(nd.stock[c])} / ${Math.round(nd.capacity[c])}</td></tr>`).join('');
